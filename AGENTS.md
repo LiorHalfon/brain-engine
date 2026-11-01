@@ -4,9 +4,10 @@ brain-engine is a memory server that vaults install by pinning a git tag. This r
 
 ## Rules
 
-- **No private content.** No memory text, business facts, prices, product or vendor names, people's names, emails, ids from a real vault, keys or a vault's instructions, anywhere: code, tests, fixtures, docs, commit messages. Test fixtures use invented neutral facts like "Acme ships orders with Parcelco". Vault-specific values belong in that vault's `brain.toml`.
+- **No private content.** No memory text, business facts, prices, product or vendor names, people's names, emails, ids from a real vault, keys or a vault's instructions, anywhere: code, tests, fixtures, docs, the skill, commit messages. Test fixtures use invented neutral facts like "Acme ships orders with Parcelco". Vault-specific values belong in that vault's `brain.toml`.
 - **Tests need no network and no API key.** Fake Graphiti where you can. Start a real FalkorDB Lite server (with `OPENAI_API_KEY=unused`, since opening the graph calls no API) only when the redis-server itself is under test. Run `just test` before every commit.
 - **The memory rules below are part of the API.** A change that breaks one breaks every vault.
+- **The skill ships with the engine.** `skills/brain-engine/SKILL.md` tells the agents running a vault how to set it up, move it, upgrade it and get its service running again. When a change alters any of that, update the skill in the same change. `tests/test_skill.py` checks that every message and README heading it quotes still exists.
 - **The state format is part of the API too.** A vault upgrading must not lose its index or graph, or re-ingest memories it already ingested: that costs OpenAI calls and can change the facts Graphiti extracts. Keep the `graph_ingestion` table, `normalize_content`, `content_sha256(type, body)` and Graphiti's default graph (no `group_id`) as they are, or write a migration and say so in `CHANGELOG.md`.
 
 ## Memory rules the code enforces

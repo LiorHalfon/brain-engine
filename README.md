@@ -256,6 +256,18 @@ uv run --project /path/to/vault brain-engine stdio --vault /path/to/vault
 
 This starts a separate server inside the client's process. It takes the same lock, so it can't run alongside `serve` or another stdio client. Prefer the HTTP service.
 
+## Agent skill
+
+`skills/brain-engine/SKILL.md` is a skill for the agents that set up a vault, move one onto the engine, upgrade its pin or get its service running again. Agents that only use the memory need nothing beyond the vault's `instructions`. Copy the skill from the tag the vault pins into the folder your agent loads project skills from, and copy it again whenever you bump the pin:
+
+```bash
+mkdir -p .claude/skills/brain-engine
+curl -fsSL https://raw.githubusercontent.com/LiorHalfon/brain-engine/<tag>/skills/brain-engine/SKILL.md \
+  -o .claude/skills/brain-engine/SKILL.md
+```
+
+`.claude/skills/` is where Claude Code looks. Other agents have their own skills folder.
+
 ## The memory model
 
 ### Memory format

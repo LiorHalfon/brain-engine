@@ -136,7 +136,7 @@ def stop_leftover_servers(graph_db: Path) -> list[RedisServer]:
         )
         raise LeftoverServersError(
             f"{len(unsaved)} leftover redis-servers hold unsaved writes to {graph_db}:\n{listed}\n"
-            "Decide which to keep, `SAVE` it and stop the others with `SHUTDOWN NOSAVE`, then start again."
+            "Decide which to keep, stop the others with `SHUTDOWN NOSAVE`, then start again: the engine saves the one left."
         )
     # The one with unsaved writes goes last, so its save is the write that stays on disk.
     for server in sorted(servers, key=lambda server: server.unsaved_changes):
