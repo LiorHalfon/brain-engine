@@ -173,3 +173,13 @@ def test_lock_message_uses_the_vault_name(tmp_path: Path) -> None:
         with pytest.raises(GraphOwnedElsewhere, match=r"^test-vault state is already in use by: http://127\.0\.0\.1:1/mcp"):
             with hold_state_lock(tmp_path, "cli", name="test-vault"):
                 pass
+
+
+def test_example_vault_loads() -> None:
+    example = Path(__file__).resolve().parents[1] / "examples" / "vault"
+
+    settings = Settings.load(example, environ={})
+
+    assert settings.name == "my-memory" and settings.instructions.startswith("My long-term memory")
+    assert settings.dated_kinds == {"decision", "session", "transcript"}
+    assert settings.kinds["project"] == "projects" and settings.kinds["note"] == "notes"

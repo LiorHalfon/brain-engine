@@ -1,0 +1,27 @@
+# A sample vault. Copy this folder, rename `name`, and write instructions for your agents.
+
+# The MCP server name agents see.
+name = "my-memory"
+
+# Sent to every agent that connects. Say what the memory is for and how to use it.
+instructions = """
+My long-term memory, shared by every agent I work with. Keep passwords, keys and other \
+secrets out of it. Call search_memory first: it answers with short facts and snippets, \
+and get_memory then reads the one or two memories that matter. Search shows what is true \
+now; pass include_history=true for how things used to be. A memory I haven't verified \
+may be wrong. If something changed, remember the new state as a new memory, and keep \
+edit_memory for fixing mistakes in the stored text.\
+"""
+
+port = 8766
+memory_dir = "memory"
+state_dir = ".brain"
+
+# Kinds that record an event get the date at the start of their filenames.
+dated_kinds = ["decision", "session", "transcript"]
+
+# Memory kind = folder under memory_dir. note, session and transcript are added if left out.
+[kinds]
+decision = "decisions"
+person = "people"
+project = "projects"
