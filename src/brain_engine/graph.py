@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from brain_engine.config import DEFAULT_GRAPH_MODEL
 from brain_engine.leftovers import stop_leftover_servers
+from brain_engine.watchdog import start_watchdog
 from brain_engine.store import MemoryRecord, content_sha256
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,10 @@ class GraphitiBackend:
         self.graph_db_path.with_name(self.graph_db_path.name + ".settings").unlink(missing_ok=True)
         falkor = AsyncFalkorDB(dbfilename=str(self.graph_db_path))
         self._falkor = falkor
+        try:
+            start_watchdog(falkor.connection.socket_file)
+        except Exception as exc:
+            logger.warning("No watcher for the graph's redis-server; a killed service will leave it running: %s", exc)
         driver = FalkorDriver(falkor_db=falkor)
         client = Graphiti(graph_driver=driver, llm_client=self._llm_client())
         await client.build_indices_and_constraints()

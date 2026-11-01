@@ -70,11 +70,20 @@ def service(tmp_path: Path) -> Iterator:
         psutil.Process(server.pid).kill()
 
 
+def _watchers(owner: int) -> list[int]:
+    return [
+        p.pid
+        for p in psutil.process_iter(["cmdline"])
+        if "brain_engine.watchdog" in (p.info["cmdline"] or []) and str(owner) in (p.info["cmdline"] or [])
+    ]
+
+
 @pytest.mark.parametrize("sig", SIGNALS, ids=lambda sig: sig.name)
 def test_signal_closes_the_service_and_its_graph(service, sig: signal.Signals) -> None:
     process, graph_db, port, log = service()
     _wait_until(lambda: _port_open(port), 30, "service did not start")
     (redis,) = find_servers(graph_db)
+    (watcher,) = _watchers(process.pid)
     before = time.time()
     time.sleep(0.05)  # so the save on close gets a later mtime than `before`
 
@@ -85,6 +94,8 @@ def test_signal_closes_the_service_and_its_graph(service, sig: signal.Signals) -
     assert not psutil.pid_exists(redis.pid), "redis-server outlived the service"
     assert find_servers(graph_db) == []
     assert graph_db.stat().st_mtime > before, "closing did not save graphiti.db"
+    # The service stopped its server itself, so the watcher has nothing left to do.
+    _wait_until(lambda: not psutil.pid_exists(watcher), 5, "watcher outlived the server")
 
 
 def test_sigterm_during_startup_still_closes_the_graph(service) -> None:
@@ -95,3 +106,23 @@ def test_sigterm_during_startup_still_closes_the_graph(service) -> None:
 
     assert process.wait(10) == 0, log.read_text()
     assert find_servers(graph_db) == []
+
+
+def test_a_killed_service_tree_still_saves_and_stops_its_graph(service) -> None:
+    # Closing a tab in some terminals (the Claude desktop app's panel, for one) SIGKILLs the
+    # service and every process it started, so no handler in the service can run.
+    process, graph_db, port, log = service()
+    _wait_until(lambda: _port_open(port), 30, "service did not start")
+    (redis,) = find_servers(graph_db)
+    before = time.time()
+    time.sleep(0.05)
+
+    tree = [process.pid] + [child.pid for child in psutil.Process(process.pid).children(recursive=True)]
+    assert _watchers(process.pid) and not set(_watchers(process.pid)) & set(tree), "the watcher must not die with the tree"
+    for pid in tree:
+        os.kill(pid, signal.SIGKILL)
+    process.wait(5)
+
+    _wait_until(lambda: not psutil.pid_exists(redis.pid), 10, "redis-server outlived the killed service")
+    assert find_servers(graph_db) == []
+    assert graph_db.stat().st_mtime > before, "graphiti.db was not saved"

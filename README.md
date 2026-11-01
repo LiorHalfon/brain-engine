@@ -168,6 +168,7 @@ Ctrl-C, `kill <pid>` (SIGTERM) and closing the terminal that runs the service (S
 - Each connected client holds a `subscriptions/listen` request open. The service ends those streams first, which is the spec's graceful close, and clients listen again when the service is back. uvicorn's 3-second timeout then only cuts off a tool call still running.
 - FalkorDB Lite runs a `redis-server` process that writes `graphiti.db` only on a timer. Closing the graph sends it `SHUTDOWN SAVE`, so the file is current and the process exits.
 - A signal that arrives while the service is still opening the graph cancels the start and closes what was opened.
+- Some terminals don't send a signal the service can catch. Closing a tab in the Claude desktop app's terminal panel SIGKILLs the service and every process it started. FalkorDB Lite's redis-server is detached from the service, so it survives that. When the graph opens, the engine starts a small watcher, detached the same way, that checks on the service twice a second. Once the service is gone the watcher sends the redis-server `SHUTDOWN SAVE`, so `graphiti.db` is saved and nothing is left running about a second later. When the service stops the server itself, the watcher just exits.
 
 Older servers stopped cleanly only on Ctrl-C. After a `kill` or a closed terminal their redis-server kept running, and whatever killed it later, a logout for example, made it write its in-memory graph over `graphiti.db`. That graph could be older than the one on disk. Two things clean up after them:
 

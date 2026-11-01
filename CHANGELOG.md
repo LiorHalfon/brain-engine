@@ -9,5 +9,6 @@ The first release, extracted from a vault's own memory server.
 - `MEMORY_ROOT` now moves only the Markdown folder. The state folder stays relative to the vault.
 - Graphiti's LLM models are set explicitly and default to `gpt-6-luna`, graphiti-core 0.31.2's own default.
 - SIGTERM and SIGHUP stop the service the way Ctrl-C does, closing the graph and its redis-server.
+- A detached watcher saves and stops the graph's redis-server when the service is killed outright, for example by closing a tab in the Claude desktop app's terminal panel.
 - On start the engine stops FalkorDB Lite redis-servers an earlier service left running for its graph, keeping the one with unsaved writes, and refuses to start if more than one has them.
 - Memories marked ingested whose episode is missing from the graph are ingested again.

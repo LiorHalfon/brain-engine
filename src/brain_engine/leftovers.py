@@ -42,7 +42,7 @@ def _socket_path(process) -> str | None:
     return sockets[0] if sockets else None
 
 
-def _connect(socket: str):
+def connect(socket: str):
     from redis import Redis
     from redis.retry import Retry
     from redis.backoff import NoBackoff
@@ -64,7 +64,7 @@ def find_servers(graph_db: Path) -> list[RedisServer]:
         socket = _socket_path(process)
         if socket is None:
             continue
-        client = _connect(socket)
+        client = connect(socket)
         try:
             directory = client.config_get("dir")["dir"]
             filename = client.config_get("dbfilename")["dbfilename"]
@@ -83,7 +83,7 @@ def find_servers(graph_db: Path) -> list[RedisServer]:
 def _shutdown(server: RedisServer, *, save: bool) -> None:
     import psutil
 
-    client = _connect(server.socket)
+    client = connect(server.socket)
     try:
         client.shutdown(save=save, nosave=not save)
     finally:
