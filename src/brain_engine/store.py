@@ -225,6 +225,13 @@ class MemoryStore:
         with self._connect() as conn:
             return conn.execute("SELECT count(*) FROM memories_fts").fetchone()[0]
 
+    def ids(self) -> set[str]:
+        """The id of every memory in the Markdown folder, searchable or not. A file that doesn't
+        parse has no id, so its memory is gone from here as it is from search."""
+        self.ensure_index()
+        with self._connect() as conn:
+            return {row["id"] for row in conn.execute("SELECT id FROM documents WHERE id IS NOT NULL")}
+
     def statuses(self, memory_ids: list[str]) -> dict[str, str]:
         """The status of each id the index knows, as of its last update."""
         if not memory_ids:

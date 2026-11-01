@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from brain_engine.graph import GraphitiBackend
+from brain_engine.service import MemoryService
 from brain_engine.store import MemoryStore, content_sha256
 
 errors = pytest.importorskip("graphiti_core.errors")
@@ -16,7 +17,8 @@ errors = pytest.importorskip("graphiti_core.errors")
 class FakeGraphiti:
     """Stands in for the Graphiti client. It removes and adds episodes the way Graphiti 0.31 does,
     including NodeNotFoundError for an episode that is already gone, and yields at every call so
-    concurrent ingests interleave."""
+    concurrent ingests interleave. Each episode's text is its one fact, so search finds a fact only
+    while its episode is in the graph."""
 
     def __init__(self) -> None:
         self.episodes: dict[str, str] = {}
@@ -39,6 +41,15 @@ class FakeGraphiti:
         episode_uuid = f"ep-{self.added}"
         self.episodes[episode_uuid] = episode_body
         return SimpleNamespace(episode=SimpleNamespace(uuid=episode_uuid), edges=[])
+
+    async def search(self, query: str) -> list:
+        await asyncio.sleep(0)
+        terms = query.casefold().split()
+        return [
+            SimpleNamespace(uuid=f"fact-{uuid}", fact=body.strip(), valid_at=None, invalid_at=None, episodes=[uuid])
+            for uuid, body in self.episodes.items()
+            if any(term in body.casefold() for term in terms)
+        ]
 
 
 def run(coro):
@@ -129,6 +140,62 @@ def test_concurrent_ingests_of_one_memory_leave_one_episode(tmp_path: Path) -> N
     assert second.get("skipped") is True
     assert client.episodes == {first["episode_uuid"]: "The scrubbed draft names no one.\n"}
     assert backend._state(memory_id)["episode_uuid"] == first["episode_uuid"]
+
+
+def test_sync_removes_the_episode_of_a_deleted_memory(tmp_path: Path) -> None:
+    # A memory file deleted by hand, or by a `git pull`, must take its facts out of the graph too.
+    store, backend, client = make_backend(tmp_path)
+    service = MemoryService(store, backend)
+    kept = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    deleted = store.remember(title="Office", content="The Springfield office opens at 9.", kind="note")
+    assert run(service.sync_graph())["indexed"] == 2
+    assert [f["fact"] for f in run(service.search("Springfield"))["facts"]] == ["The Springfield office opens at 9."]
+    episode = backend._state(deleted["id"])["episode_uuid"]
+
+    (store.root / deleted["path"]).unlink()
+    result = run(service.sync_graph())
+
+    assert result == {"indexed": 0, "removed": 1, "skipped": 1, "errors": []}
+    assert episode not in client.episodes and backend._state(deleted["id"]) is None
+    assert run(service.search("Springfield"))["facts"] == []
+    assert [f["source_memory_ids"] for f in run(service.search("Parcelco"))["facts"]] == [[kept["id"]]]
+    assert run(service.sync_graph()) == {"indexed": 0, "removed": 0, "skipped": 1, "errors": []}
+
+
+def test_sync_forgets_deleted_memories_that_have_no_episode_left(tmp_path: Path) -> None:
+    store, backend, client = make_backend(tmp_path)
+    service = MemoryService(store, backend)
+    store.remember(title="Mascot", content="Acme's mascot is a heron named Pip.", kind="note")
+    gone = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    failed = store.remember(title="Office", content="The Springfield office opens at 9.", kind="note")
+    run(service.sync_graph())
+    client.episodes.pop(backend._state(gone["id"])["episode_uuid"])  # e.g. dropped by a rebuilt graph
+    backend._write_state(failed["id"], "hash", episode_uuid=None, status="error", error="rate limited")
+
+    for created in (gone, failed):
+        (store.root / created["path"]).unlink()
+
+    assert run(service.sync_graph()) == {"indexed": 0, "removed": 2, "skipped": 1, "errors": []}
+    assert backend._state(gone["id"]) is None and backend._state(failed["id"]) is None
+
+
+def test_a_failed_removal_is_tried_again_by_the_next_sync(tmp_path: Path) -> None:
+    store, backend, client = make_backend(tmp_path)
+    service = MemoryService(store, backend)
+    store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    deleted = store.remember(title="Office", content="The Springfield office opens at 9.", kind="note")
+    run(service.sync_graph())
+    (store.root / deleted["path"]).unlink()
+    client.remove_error = RuntimeError("falkordb is down")
+
+    result = run(service.sync_graph())
+
+    assert result["removed"] == 0
+    assert result["errors"] == [{"memory_id": deleted["id"], "error": "falkordb is down"}]
+    assert backend._state(deleted["id"]) is not None
+    client.remove_error = None
+    assert run(service.sync_graph())["removed"] == 1
+    assert run(service.search("Springfield"))["facts"] == []
 
 
 async def test_close_saves_the_graph_and_stops_its_redis_server(tmp_path: Path, monkeypatch) -> None:

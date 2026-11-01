@@ -44,6 +44,8 @@ class GraphBackend(Protocol):
 
     async def remove(self, memory_id: str) -> None: ...
 
+    def memory_ids(self) -> set[str]: ...
+
     async def snapshot(self) -> dict[str, Any]: ...
 
     async def close(self) -> None: ...
@@ -63,6 +65,9 @@ class DisabledGraphBackend:
 
     async def remove(self, memory_id: str) -> None:
         return None
+
+    def memory_ids(self) -> set[str]:
+        return set()
 
     async def snapshot(self) -> dict[str, Any]:
         return {"enabled": False, "nodes": [], "edges": []}
@@ -384,13 +389,33 @@ class GraphitiBackend:
         return (await client.search_(query, config=config)).edges
 
     async def remove(self, memory_id: str) -> None:
-        previous = self._state(memory_id)
-        if not previous or not previous["episode_uuid"]:
-            return
-        client = await self._get_client()
-        await client.remove_episode(previous["episode_uuid"])
+        """Remove the memory's episode and forget the memory.
+
+        Graphiti deletes the facts and entities only this episode produced, drops the episode from
+        the sources of facts other episodes share, and asks the LLM to summarize again the entities
+        that remain. A fact this episode invalidated stays invalidated. If the removal fails, the
+        memory's row stays, so the next sync tries again.
+        """
+        # Serialized with ingest, so an ingest in flight can't add an episode after the removal.
+        async with self._memory_locks.setdefault(memory_id, asyncio.Lock()):
+            previous = self._state(memory_id)
+            if previous is None:
+                return
+            if previous["episode_uuid"]:
+                from graphiti_core.errors import NodeNotFoundError
+
+                client = await self._get_client()
+                try:
+                    await client.remove_episode(previous["episode_uuid"])
+                except NodeNotFoundError:
+                    pass  # already gone from the graph
+            with self._connect_state() as conn:
+                conn.execute("DELETE FROM graph_ingestion WHERE memory_id=?", (memory_id,))
+
+    def memory_ids(self) -> set[str]:
+        """Every memory graph-state has a row for, including ingests that failed."""
         with self._connect_state() as conn:
-            conn.execute("DELETE FROM graph_ingestion WHERE memory_id=?", (memory_id,))
+            return {row["memory_id"] for row in conn.execute("SELECT memory_id FROM graph_ingestion")}
 
     async def snapshot(self) -> dict[str, Any]:
         """All entities and facts, for the read-only /graph viewer. Invalidated facts are included."""

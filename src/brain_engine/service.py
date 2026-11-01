@@ -261,8 +261,25 @@ class MemoryService:
     async def sync_graph(self) -> dict[str, Any]:
         with self._measure("sync_memory_graph") as timing:
             indexed = 0
+            removed = 0
             skipped = 0
             errors: list[dict[str, str]] = []
+            # Markdown is authoritative: a memory whose file is gone takes its episode with it.
+            # Removals go first, so the ingests below don't resolve entities against their facts.
+            on_disk = self.store.ids()
+            gone = sorted(self.graph.memory_ids() - on_disk) if self.graph.enabled else []
+            for memory_id in gone:
+                if not on_disk:
+                    # More likely a wrong MEMORY_ROOT than every memory deleted, and removing them
+                    # all would cost a full rebuild once the folder is right.
+                    errors.append({"memory_id": memory_id, "error": f"not removed: {self.store.root} holds no memories"})
+                    continue
+                try:
+                    with timing.graph():
+                        await self.graph.remove(memory_id)
+                    removed += 1
+                except Exception as exc:
+                    errors.append({"memory_id": memory_id, "error": str(exc)})
             for record in self.store.iter_records(searchable_only=True):
                 if record.metadata.get("status") == "superseded":
                     # Keep historical episodes already in the graph, but don't newly ingest a source
@@ -279,8 +296,8 @@ class MemoryService:
                 except Exception as exc:
                     errors.append({"memory_id": record.id, "error": str(exc)})
             if errors:
-                timing.error = f"{len(errors)} memories failed to ingest"
-            return {"indexed": indexed, "skipped": skipped, "errors": errors}
+                timing.error = f"{len(errors)} memories failed to sync"
+            return {"indexed": indexed, "removed": removed, "skipped": skipped, "errors": errors}
 
 
 def _all_superseded(memory_ids: list[str], statuses: dict[str, str]) -> bool:

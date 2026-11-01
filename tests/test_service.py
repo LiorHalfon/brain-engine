@@ -43,6 +43,9 @@ class FakeGraph:
     async def remove(self, memory_id: str) -> None:
         self.records.pop(memory_id, None)
 
+    def memory_ids(self) -> set[str]:
+        return set(self.records)
+
     async def snapshot(self) -> dict:
         if self.fail_search:
             raise RuntimeError("graph unavailable")
@@ -177,6 +180,34 @@ def test_edit_reingests_same_memory_id(tmp_path: Path) -> None:
     assert edited["id"] == created["id"]
     assert graph.ingested == [created["id"], created["id"]]
     assert store.record(created["id"]).content == "The stored text is corrected.\n"
+
+
+def test_sync_keeps_the_episodes_of_superseded_memories(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+    old = run(service.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note"))
+    new = run(service.correct(old["id"], correction="The Springfield office opens at 10.", reason="Hours changed"))
+
+    result = run(service.sync_graph())
+
+    # Only a deleted file removes an episode. A superseded memory's episode is the graph's history.
+    assert result["removed"] == 0 and graph.memory_ids() == {old["id"], new["id"]}
+
+
+def test_sync_removes_nothing_when_the_markdown_folder_is_empty(tmp_path: Path) -> None:
+    # A wrong MEMORY_ROOT reads as an empty vault. Removing every episode would cost a full rebuild.
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+    created = run(service.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note"))
+    (store.root / created["path"]).unlink()
+
+    result = run(service.sync_graph())
+
+    assert result["removed"] == 0 and graph.memory_ids() == {created["id"]}
+    assert [error["memory_id"] for error in result["errors"]] == [created["id"]]
+    assert "holds no memories" in result["errors"][0]["error"]
 
 
 def test_graph_snapshot_reads_each_memory_once(tmp_path: Path, monkeypatch) -> None:
