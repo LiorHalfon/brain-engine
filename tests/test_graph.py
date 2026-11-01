@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from brain_engine.graph import GraphitiBackend
-from brain_engine.store import MemoryStore
+from brain_engine.store import MemoryStore, content_sha256
 
 errors = pytest.importorskip("graphiti_core.errors")
 
@@ -154,6 +155,35 @@ async def test_close_saves_the_graph_and_stops_its_redis_server(tmp_path: Path, 
     finally:
         await reopened.close()
     assert [record["name"] for record in records] == ["kept"]
+
+
+async def test_memories_whose_episode_is_gone_are_ingested_again(tmp_path: Path, monkeypatch, caplog) -> None:
+    # A leftover redis-server that wrote an older graph over graphiti.db leaves memories marked ok
+    # in graph-state whose episodes are no longer in the graph.
+    pytest.importorskip("redislite")
+    monkeypatch.setenv("OPENAI_API_KEY", "unused")  # opening the graph makes no OpenAI calls
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    kept = store.record(store.remember(title="Kept", content="Acme ships orders with Parcelco.")["id"])
+    lost = store.record(store.remember(title="Lost", content="The Springfield office opens at 9.")["id"])
+    backend = GraphitiBackend(store.state_dir)
+    await backend.start()
+    await backend._client.driver.execute_query("CREATE (:Episodic {uuid: 'ep-kept'})")
+    backend._write_state(kept.id, content_sha256("note", kept.content), episode_uuid="ep-kept", status="ok")
+    backend._write_state(lost.id, content_sha256("note", lost.content), episode_uuid="ep-lost", status="ok")
+    await backend.close()
+
+    reopened = GraphitiBackend(store.state_dir)
+    with caplog.at_level(logging.WARNING, logger="brain_engine.graph"):
+        await reopened.start()
+    await reopened.close()
+
+    assert reopened._state(kept.id)["status"] == "ok"
+    assert reopened._state(lost.id)["status"] == "missing" and reopened._state(lost.id)["episode_uuid"] is None
+    assert "ingested again: 1" in caplog.text
+    reopened._client = FakeGraphiti()
+    assert (await reopened.ingest(kept))["skipped"] is True
+    assert (await reopened.ingest(lost)).get("skipped") is None
+    assert reopened._state(lost.id)["status"] == "ok"
 
 
 class SearchGraphiti:

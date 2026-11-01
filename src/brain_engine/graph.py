@@ -160,7 +160,31 @@ class GraphitiBackend:
         driver = FalkorDriver(falkor_db=falkor)
         client = Graphiti(graph_driver=driver, llm_client=self._llm_client())
         await client.build_indices_and_constraints()
+        await self._forget_missing_episodes(client)
         return client
+
+    async def _forget_missing_episodes(self, client: Any) -> int:
+        """Mark memories whose episode is no longer in the graph as not ingested.
+
+        A redis-server left running by an earlier service could write an older graph over
+        graphiti.db, dropping episodes graph-state still calls ok. Marked `missing`, they are
+        ingested again by the start-up catch-up and by sync-graph.
+        """
+        records, _, _ = await client.driver.execute_query("MATCH (e:Episodic) RETURN e.uuid AS uuid")
+        in_graph = {str(record["uuid"]) for record in records}
+        with self._connect_state() as conn:
+            rows = conn.execute(
+                "SELECT memory_id, episode_uuid FROM graph_ingestion WHERE status='ok' AND episode_uuid IS NOT NULL"
+            ).fetchall()
+            missing = [row["memory_id"] for row in rows if row["episode_uuid"] not in in_graph]
+            conn.executemany(
+                "UPDATE graph_ingestion SET status='missing', episode_uuid=NULL, "
+                "last_error='episode missing from graph' WHERE memory_id=?",
+                [(memory_id,) for memory_id in missing],
+            )
+        if missing:
+            logger.warning("Memories marked ingested whose episode is missing from the graph, to be ingested again: %d", len(missing))
+        return len(missing)
 
     def _llm_client(self) -> Any:
         # Named explicitly: graphiti-core 0.30.2's default small model was retired by OpenAI, and
