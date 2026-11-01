@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import signal
 import socket
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import anyio
@@ -14,7 +20,10 @@ from brain_engine.config import Settings
 from brain_engine.lock import hold_state_lock
 from brain_engine.service import MemoryService
 
+logger = logging.getLogger(__name__)
+
 GRAPH_VIEW = Path(__file__).with_name("graph_view.html")
+SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -56,6 +65,36 @@ class _Server(uvicorn.Server):
         if entry is not None and isinstance(entry.handler, ListenHandler):
             entry.handler.close()
         await super().shutdown(sockets)
+
+    @contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        # `_stop_on_signals` handles them for the service's whole life instead. uvicorn's own
+        # handlers re-raise SIGTERM once uvicorn is done, which ended the process before the
+        # service closed the graph.
+        yield
+
+
+@contextmanager
+def _stop_on_signals(on_signal: Callable[[int], None]) -> Iterator[None]:
+    """Call `on_signal` for Ctrl-C (SIGINT), `kill` (SIGTERM) and a closed terminal (SIGHUP) alike.
+
+    By default only Ctrl-C ended the service through its `finally`. SIGTERM and SIGHUP killed it
+    and left FalkorDB Lite's redis-server running, to write an older graph over graphiti.db later.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield  # signal handlers can only be set from the main thread
+        return
+    originals = {sig: signal.signal(sig, lambda sig, frame: on_signal(sig)) for sig in SHUTDOWN_SIGNALS}
+    try:
+        yield
+    finally:
+        for sig, handler in originals.items():
+            signal.signal(sig, handler)
+
+
+def _cancel_soon(task: asyncio.Task) -> None:
+    # A signal handler runs between two bytecodes of whatever the loop is doing; let the loop cancel.
+    task.get_loop().call_soon_threadsafe(task.cancel)
 
 
 def create_server(service: MemoryService, settings: Settings) -> MCPServer:
@@ -178,35 +217,54 @@ async def serve_http(
     service = service or MemoryService.from_settings(settings)
     with hold_state_lock(service.store.state_dir, settings.url, settings.name):
         _ensure_port_free(settings.host, settings.port)
-        await service.start(ingest_in_background=True)
-        try:
-            mcp = create_server(service, settings)
-            app = mcp.streamable_http_app(host=settings.host)
-            # _Server ends the listen streams, so the timeout only cuts off a tool call still running.
-            config = uvicorn.Config(
-                app, host=settings.host, port=settings.port, log_level="info", timeout_graceful_shutdown=3
-            )
-            server = _Server(config, mcp)
-            async with anyio.create_task_group() as tg:
-                if stop is not None:
+        mcp = create_server(service, settings)
+        app = mcp.streamable_http_app(host=settings.host)
+        # _Server ends the listen streams, so the timeout only cuts off a tool call still running.
+        config = uvicorn.Config(
+            app, host=settings.host, port=settings.port, log_level="info", timeout_graceful_shutdown=3
+        )
+        server = _Server(config, mcp)
+        main = asyncio.current_task()
+        assert main is not None
+        serving = False
 
-                    async def _watch_stop() -> None:
-                        await stop.wait()
-                        server.should_exit = True
+        def on_signal(sig: int) -> None:
+            if serving:
+                server.handle_exit(sig, None)  # uvicorn's graceful shutdown; a second Ctrl-C forces it
+            elif not server.should_exit:
+                server.should_exit = True
+                _cancel_soon(main)  # still opening the graph: stop there and close what is open
 
-                    tg.start_soon(_watch_stop)
-                await server.serve()
-                tg.cancel_scope.cancel()
-        finally:
-            await service.close()
+        with _stop_on_signals(on_signal):
+            try:
+                await service.start(ingest_in_background=True)
+                async with anyio.create_task_group() as tg:
+                    if stop is not None:
+
+                        async def _watch_stop() -> None:
+                            await stop.wait()
+                            server.should_exit = True
+
+                        tg.start_soon(_watch_stop)
+                    serving = True
+                    await server.serve()
+                    serving = False
+                    tg.cancel_scope.cancel()
+            finally:
+                serving = False
+                await service.close()
+                logger.info("%s stopped", settings.name)
 
 
 async def serve_stdio(settings: Settings) -> None:
     """Legacy transport: one server per client process. Only one may run at a time."""
     service = MemoryService.from_settings(settings)
-    with hold_state_lock(service.store.state_dir, "stdio", settings.name):
-        await service.start(ingest_in_background=True)
+    main = asyncio.current_task()
+    assert main is not None
+    with hold_state_lock(service.store.state_dir, "stdio", settings.name), _stop_on_signals(lambda sig: _cancel_soon(main)):
         try:
+            await service.start(ingest_in_background=True)
             await create_server(service, settings).run_stdio_async()
         finally:
             await service.close()
+            logger.info("%s stopped", settings.name)

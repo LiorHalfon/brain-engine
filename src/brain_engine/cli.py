@@ -75,14 +75,13 @@ def main() -> None:
     except ConfigError as exc:
         raise SystemExit(str(exc)) from None
     try:
-        if args.command == "serve":
+        if args.command in ("serve", "stdio"):
             try:
-                asyncio.run(serve_http(settings))
-            except KeyboardInterrupt:
-                # uvicorn re-raises the Ctrl+C it handled, after its graceful shutdown is done.
+                asyncio.run(serve_http(settings) if args.command == "serve" else serve_stdio(settings))
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # A signal that arrived before the server was up cancels start-up; the service
+                # has closed by the time it gets here.
                 pass
-        elif args.command == "stdio":
-            asyncio.run(serve_stdio(settings))
         elif args.command == "reindex":
             # FTS only; safe to run while the service is up.
             print(MemoryService.from_settings(settings).store.reindex())
