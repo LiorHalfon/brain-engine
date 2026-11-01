@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from brain_engine.config import ConfigError, Settings, find_vault
+from brain_engine.leftovers import LeftoverServersError
 from brain_engine.lock import GraphOwnedElsewhere, hold_state_lock
 from brain_engine.server import PortInUse, serve_http, serve_stdio
 from brain_engine.service import MemoryService
@@ -95,7 +96,7 @@ def main() -> None:
             _print(asyncio.run(_run_graph_command(settings, "search_memory", arguments)))
     except GraphOwnedElsewhere as exc:
         raise SystemExit(f"{exc}. Only one {settings.name} service may run at a time.") from None
-    except PortInUse as exc:
+    except (PortInUse, LeftoverServersError) as exc:
         raise SystemExit(str(exc)) from None
 
 

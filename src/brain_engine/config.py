@@ -72,9 +72,20 @@ def _dated_kinds(config: dict[str, Any], kinds: dict[str, str]) -> frozenset[str
     return frozenset(value)
 
 
+def _flag(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    value = _env(environ, name)
+    if value is None:
+        return default
+    if value.lower() in {"1", "true", "yes", "on"}:
+        return True
+    if value.lower() in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be true or false, not {value!r}")
+
+
 def _port(raw: object, source: str) -> int:
     try:
-        if isinstance(raw, bool):
+        if isinstance(raw, (bool, float)):
             raise ValueError
         port = int(raw)  # type: ignore[call-overload]
         if not 0 < port < 65536:
@@ -131,7 +142,6 @@ class Settings:
         if access not in {"read-only", "read-write"}:
             raise ConfigError("MEMORY_ACCESS must be 'read-only' or 'read-write'")
         env_port = _env(environ, "MEMORY_PORT")
-        graph_enabled = _env(environ, "MEMORY_GRAPH_ENABLED")
         return cls(
             vault=vault,
             name=name,
@@ -153,7 +163,7 @@ class Settings:
             access=access,
             actor=_env(environ, "MEMORY_ACTOR") or f"{name}/local",
             human_id=_env(environ, "MEMORY_HUMAN_ID") or "owner",
-            graph_enabled=graph_enabled is None or graph_enabled.lower() in {"1", "true", "yes", "on"},
+            graph_enabled=_flag(environ, "MEMORY_GRAPH_ENABLED", True),
             graph_model=_env(environ, "MEMORY_GRAPH_MODEL") or _str(config, "graph_model", DEFAULT_GRAPH_MODEL),
             graph_small_model=(
                 _env(environ, "MEMORY_GRAPH_SMALL_MODEL")

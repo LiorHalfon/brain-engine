@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import socket
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -84,7 +86,12 @@ def _stop_on_signals(on_signal: Callable[[int], None]) -> Iterator[None]:
     if threading.current_thread() is not threading.main_thread():
         yield  # signal handlers can only be set from the main thread
         return
-    originals = {sig: signal.signal(sig, lambda sig, frame: on_signal(sig)) for sig in SHUTDOWN_SIGNALS}
+    originals = {
+        sig: signal.signal(sig, lambda sig, frame: on_signal(sig))
+        for sig in SHUTDOWN_SIGNALS
+        # Ignored on purpose, as `nohup` does with SIGHUP: keep it that way.
+        if signal.getsignal(sig) is not signal.SIG_IGN
+    }
     try:
         yield
     finally:
@@ -259,12 +266,35 @@ async def serve_http(
 async def serve_stdio(settings: Settings) -> None:
     """Legacy transport: one server per client process. Only one may run at a time."""
     service = MemoryService.from_settings(settings)
-    main = asyncio.current_task()
-    assert main is not None
-    with hold_state_lock(service.store.state_dir, "stdio", settings.name), _stop_on_signals(lambda sig: _cancel_soon(main)):
+    loop = asyncio.get_running_loop()
+    # A client often closes stdin and then signals, so the service is closed by whichever comes
+    # first and the other waits for it.
+    closer: asyncio.Task[None] | None = None
+    stdin_closed = False
+
+    async def close_and_exit() -> None:
+        # The MCP SDK reads stdin in a worker thread that no cancellation reaches, so a cancelled
+        # server would wait for the client's next message. Close here and leave instead.
+        await service.close()
+        logger.info("%s stopped", settings.name)
+        sys.stderr.flush()
+        os._exit(0)
+
+    def start_closing() -> None:
+        nonlocal closer
+        if closer is None and not stdin_closed:
+            closer = loop.create_task(close_and_exit())
+
+    with (
+        hold_state_lock(service.store.state_dir, "stdio", settings.name),
+        _stop_on_signals(lambda sig: loop.call_soon_threadsafe(start_closing)),
+    ):
         try:
             await service.start(ingest_in_background=True)
             await create_server(service, settings).run_stdio_async()
         finally:
+            if closer is not None:
+                await closer  # it exits the process once the service is closed
+            stdin_closed = True
             await service.close()
             logger.info("%s stopped", settings.name)

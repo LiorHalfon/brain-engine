@@ -22,6 +22,8 @@ A memory server for AI agents. A vault is a folder of Markdown memories with YAM
 
 Every client connects to the same running service. It is the only process that opens Graphiti's embedded FalkorDB Lite database. Graphiti and SQLite are indexes you can throw away and rebuild. The Markdown is what counts.
 
+It runs on macOS and Linux with Python 3.12 or later.
+
 A vault holds no server code. It has a `brain.toml`, its `memory/` folder, a `pyproject.toml` that pins an engine tag, and whatever scripts it wants. A fix lands here once and reaches a vault when that vault bumps its pin.
 
 ## Vault layout
@@ -163,7 +165,7 @@ A Graphiti ingest takes about 20 seconds of OpenAI calls, against about 40 ms fo
 
 ### Stopping
 
-Ctrl-C, `kill <pid>` (SIGTERM) and closing the terminal that runs the service (SIGHUP) all stop it the same way. The service logs `<name> stopped` when it is done.
+Ctrl-C, `kill <pid>` (SIGTERM) and closing the terminal that runs the service (SIGHUP) all stop it the same way, for `serve` and `stdio` alike. The service logs `<name> stopped` when it is done. A service started with SIGHUP ignored, as `nohup` does, keeps ignoring it.
 
 - Each connected client holds a `subscriptions/listen` request open. The service ends those streams first, which is the spec's graceful close, and clients listen again when the service is back. uvicorn's 3-second timeout then only cuts off a tool call still running.
 - FalkorDB Lite runs a `redis-server` process that writes `graphiti.db` only on a timer. Closing the graph sends it `SHUTDOWN SAVE`, so the file is current and the process exits.
@@ -172,7 +174,7 @@ Ctrl-C, `kill <pid>` (SIGTERM) and closing the terminal that runs the service (S
 
 Older servers stopped cleanly only on Ctrl-C. After a `kill` or a closed terminal their redis-server kept running, and whatever killed it later, a logout for example, made it write its in-memory graph over `graphiti.db`. That graph could be older than the one on disk. Two things clean up after them:
 
-- On start, before opening the graph, the engine looks for running FalkorDB Lite redis-servers whose `dir` and `dbfilename` are its own `graphiti.db`. One with no unsaved changes is stopped without saving. If exactly one has unsaved changes, it holds writes from a service that died, so it saves and then stops. If more than one has unsaved changes, the engine refuses to start and names them, since guessing would lose data. The log says what was stopped.
+- On start, before opening the graph, the engine looks for running FalkorDB Lite redis-servers working in its state folder with its `graphiti.db` as their database. One with no unsaved changes is stopped without saving. If exactly one has unsaved changes, it holds writes from a service that died, so it saves and then stops. If more than one has unsaved changes, the engine refuses to start and names them, since guessing would lose data. It also refuses when a server for its graph doesn't answer, since it may still be saving. The log says what was stopped.
 - Opening the graph checks graph-state against the episodes actually in the graph. A memory marked ingested whose episode is gone is marked `missing`, and the start-up catch-up and `sync-graph` ingest it again. The log counts them.
 
 The engine also deletes FalkorDB Lite's `graphiti.db.settings` before opening, so it never reattaches to a server it didn't start. In a copied state folder that file names the original vault's server.

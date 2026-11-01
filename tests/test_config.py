@@ -108,6 +108,7 @@ def test_missing_brain_toml(tmp_path: Path) -> None:
         ({"instructions": 3}, "instructions"),
         ({"dated_kinds": ["decision"]}, "decision"),
         ({"port": "eighty"}, "port"),
+        ({"port": 8766.9}, "port"),
         ({"kinds": {"Decision": "decisions"}}, "Decision"),
     ],
 )
@@ -123,6 +124,14 @@ def test_missing_name_is_named(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="name"):
         Settings.load(tmp_path, environ={})
+
+
+def test_a_misspelled_graph_switch_is_refused(tmp_path: Path) -> None:
+    vault = make_vault(tmp_path / "vault")
+
+    assert Settings.load(vault, environ={"MEMORY_GRAPH_ENABLED": "off"}).graph_enabled is False
+    with pytest.raises(ConfigError, match="MEMORY_GRAPH_ENABLED"):
+        Settings.load(vault, environ={"MEMORY_GRAPH_ENABLED": "ture"})
 
 
 def test_bad_access_is_refused(tmp_path: Path) -> None:

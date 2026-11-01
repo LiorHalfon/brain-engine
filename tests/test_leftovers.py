@@ -155,3 +155,30 @@ def test_a_reused_pid_is_not_the_owner() -> None:
     me = psutil.Process()
     assert _owner_alive(me.pid, me.create_time())
     assert not _owner_alive(me.pid, me.create_time() - 60)  # same pid, started earlier: someone else's
+
+
+def test_a_path_in_another_case_still_finds_the_server(tmp_path: Path, leave_server) -> None:
+    folder = tmp_path / "CaseVault"
+    folder.mkdir()
+    if not (tmp_path / "casevault").exists():
+        pytest.skip("case-sensitive file system")
+    pid = leave_server(folder / "graphiti.db", "write")
+
+    assert [server.pid for server in find_servers(tmp_path / "casevault" / "graphiti.db")] == [pid]
+
+
+def test_a_server_that_does_not_answer_refuses_start(tmp_path: Path, leave_server, monkeypatch) -> None:
+    # It may be busy saving; starting a second server beside it could let it overwrite the graph later.
+    import signal
+
+    from brain_engine import leftovers
+
+    monkeypatch.setattr(leftovers, "QUERY_TIMEOUT_SECONDS", 0.5)
+    db = tmp_path / "graphiti.db"
+    pid = leave_server(db, "write")
+    psutil.Process(pid).send_signal(signal.SIGSTOP)
+    try:
+        with pytest.raises(LeftoverServersError, match=f"pid {pid}.*doesn't answer"):
+            stop_leftover_servers(db)
+    finally:
+        psutil.Process(pid).send_signal(signal.SIGCONT)

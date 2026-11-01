@@ -317,3 +317,18 @@ def test_writes_ingest_inline_when_the_graph_did_not_start(tmp_path: Path) -> No
 
     # Queueing would only fail later, once per memory, where nobody sees it.
     assert run(scenario())["graph"] == {"indexed": False, "error": "OPENAI_API_KEY is required"}
+
+
+def test_leftover_servers_stop_start_instead_of_falling_back(tmp_path: Path) -> None:
+    import pytest
+
+    from brain_engine.leftovers import LeftoverServersError
+
+    class Contested(FakeGraph):
+        async def start(self) -> None:
+            raise LeftoverServersError("2 leftover redis-servers hold unsaved writes")
+
+    service = MemoryService(MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner"), Contested())
+
+    with pytest.raises(LeftoverServersError):
+        run(service.start(ingest_in_background=True))

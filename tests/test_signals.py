@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
@@ -126,3 +127,77 @@ def test_a_killed_service_tree_still_saves_and_stops_its_graph(service) -> None:
     _wait_until(lambda: not psutil.pid_exists(redis.pid), 10, "redis-server outlived the killed service")
     assert find_servers(graph_db) == []
     assert graph_db.stat().st_mtime > before, "graphiti.db was not saved"
+
+
+def _start_stdio(vault: Path, log: Path) -> subprocess.Popen:
+    env = {**os.environ, "OPENAI_API_KEY": "unused"}
+    return subprocess.Popen(
+        [sys.executable, "-m", "brain_engine.cli", "stdio", "--vault", str(vault)],
+        env=env,
+        stdin=subprocess.PIPE,  # held open, like a connected client
+        stdout=subprocess.PIPE,
+        stderr=log.open("w"),
+    )
+
+
+def _initialize(process: subprocess.Popen) -> None:
+    """Complete MCP's initialize handshake, so the server is up and reading stdin."""
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}},
+    }
+    process.stdin.write((json.dumps(request) + "\n").encode())
+    process.stdin.flush()
+    response = json.loads(process.stdout.readline())
+    assert response["id"] == 1 and "result" in response, response
+
+
+@pytest.mark.parametrize("close_stdin_first", [False, True], ids=["stdin-open", "stdin-closed"])
+def test_sigterm_stops_a_stdio_server_and_its_graph(tmp_path: Path, close_stdin_first: bool) -> None:
+    # MCP's stdin reader blocks in a thread that cancellation can't reach. Clients usually close
+    # stdin and then send SIGTERM, which used to land in the middle of closing the graph.
+    vault = make_vault(tmp_path / "vault")
+    graph_db = vault / ".brain" / "graphiti.db"
+    log = tmp_path / "stdio.log"
+    process = _start_stdio(vault, log)
+    try:
+        _initialize(process)
+        (redis,) = find_servers(graph_db)
+        before = time.time()
+        time.sleep(0.05)
+
+        if close_stdin_first:
+            process.stdin.close()
+        process.send_signal(signal.SIGTERM)
+
+        assert process.wait(10) == 0, log.read_text()
+        assert not psutil.pid_exists(redis.pid) and find_servers(graph_db) == []
+        assert graph_db.stat().st_mtime > before, "closing did not save graphiti.db"
+    finally:
+        if process.poll() is None:
+            process.kill()
+        for server in find_servers(graph_db):
+            psutil.Process(server.pid).kill()
+
+
+def test_sighup_is_left_alone_under_nohup(service, monkeypatch) -> None:
+    # `nohup brain-engine serve &` must keep running when its terminal closes.
+    real_popen = subprocess.Popen
+
+    def ignoring_sighup(*args, **kwargs):
+        return real_popen(*args, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN), **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", ignoring_sighup)
+    process, graph_db, port, log = service()
+    monkeypatch.setattr(subprocess, "Popen", real_popen)
+    _wait_until(lambda: _port_open(port), 30, "service did not start")
+
+    process.send_signal(signal.SIGHUP)
+    time.sleep(1)
+    assert process.poll() is None, "SIGHUP stopped a service started with SIGHUP ignored"
+
+    process.send_signal(signal.SIGTERM)
+    assert process.wait(10) == 0
+    assert find_servers(graph_db) == []

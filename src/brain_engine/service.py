@@ -8,6 +8,7 @@ from typing import Any
 
 from brain_engine.config import Settings
 from brain_engine.graph import GraphBackend, GraphFact, GraphitiBackend
+from brain_engine.leftovers import LeftoverServersError
 from brain_engine.metrics import Metrics, Timing
 from brain_engine.store import MemoryStore, SearchResult
 
@@ -53,6 +54,10 @@ class MemoryService:
         self.store.ensure_index()
         try:
             await self.graph.start()
+        except LeftoverServersError:
+            # Not a reason to serve without the graph: someone has to decide which server's
+            # unsaved writes to keep, or wait for one that is still saving.
+            raise
         except Exception as exc:
             # Same fallback as per-request graph failures: Markdown + FTS keep working.
             logger.warning("Graphiti unavailable, serving Markdown/FTS only: %s", exc)

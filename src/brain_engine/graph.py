@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 # second or more on a cold one, and as long as OpenAI takes when it is struggling. Past this budget,
 # search answers from the graph's keyword index, which is local and takes about 40 ms.
 SEARCH_BUDGET_SECONDS = 0.5
+# Saving a graph takes well under a second; past this, closing gives up rather than hang the exit.
+CLOSE_TIMEOUT_SECONDS = 60
 
 
 @dataclass
@@ -428,7 +430,11 @@ class GraphitiBackend:
 
     async def close(self) -> None:
         if self._falkor is not None:
-            await self._stop_redis(self._falkor.connection.socket_file)
+            try:
+                await asyncio.wait_for(self._stop_redis(self._falkor.connection.socket_file), CLOSE_TIMEOUT_SECONDS)
+            except TimeoutError:
+                # Its watcher stops it once this process is gone, and the next start would too.
+                logger.warning("The graph's redis-server did not stop within %ss", CLOSE_TIMEOUT_SECONDS)
             self._falkor = None
         if self._client is not None:
             await self._client.close()
