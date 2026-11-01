@@ -1,6 +1,6 @@
 [project]
 name = "brain-engine"
-version = "0.1.0"
+version = "0.1.1"
 description = "A memory server for AI agents: a Markdown vault, an FTS5 index, a Graphiti graph and MCP tools."
 readme = "README.md"
 license = "MIT"

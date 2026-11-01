@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
 - `skills/brain-engine/` is a skill for the agents that set up, move, upgrade or troubleshoot a vault. The README's "Agent skill" section shows how a vault installs it.
 - The leftover-servers error says to stop the servers you don't keep with `SHUTDOWN NOSAVE` and start again, so the engine saves the one left. It used to say to `SAVE` the kept one first, which let another server's timed save overwrite it.
