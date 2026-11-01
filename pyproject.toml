@@ -1,0 +1,43 @@
+[project]
+name = "brain-engine"
+version = "0.1.0"
+description = "A memory server for AI agents: a Markdown vault, an FTS5 index, a Graphiti graph and MCP tools."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp[cli]>=2,<3",
+  "PyYAML>=6,<7",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+graph = [
+  "graphiti-core[falkordblite]>=0.31.2,<0.32",
+  # graphiti-core imports httpx without declaring it; openai>=3 no longer pulls it in.
+  "httpx>=0.27",
+  # Finds FalkorDB Lite redis-servers left running by an earlier service.
+  "psutil>=5.9",
+]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<1",
+]
+
+[project.scripts]
+brain-engine = "brain_engine.cli:main"
+
+[project.urls]
+Repository = "https://github.com/LiorHalfon/brain-engine"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brain_engine"]
