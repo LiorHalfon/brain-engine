@@ -137,7 +137,7 @@ The vault's `pyproject.toml` and `uv.lock` don't change, so there is nothing to 
 ```bash
 brain-engine serve          # Streamable HTTP on http://127.0.0.1:<port>/mcp
 brain-engine search "query" # through the service if it runs, otherwise locally
-brain-engine sync-graph     # ingest new and edited Markdown into Graphiti
+brain-engine sync-graph     # ingest new and edited Markdown into Graphiti, remove deleted memories
 brain-engine reindex        # rebuild the FTS5 index from the Markdown
 brain-engine metrics        # how long operations took on this machine; --days N
 ```
@@ -161,7 +161,7 @@ A Graphiti ingest takes about 20 seconds of OpenAI calls, against about 40 ms fo
 - Stopping the service doesn't wait for an ingest in flight. The memory is already in Markdown and FTS, and the next start queues it again.
 - A failed ingest is logged and recorded in graph-state and `metrics`, and the queue moves on. The next start retries it.
 - If Graphiti didn't start, writes ingest right away and return the error, rather than queueing work that would fail where nobody sees it.
-- `sync_memory_graph`, and the CLI when no service runs, ingest right away and return counts.
+- `sync_memory_graph`, and the CLI when no service runs, ingest and remove right away and return counts.
 
 ### Stopping
 
@@ -313,6 +313,16 @@ Don't overwrite a memory because reality changed. "The office opens at 9" in Sep
 - `correct_memory` records that a memory was wrong. It writes a new memory with `corrects: <old id>` and marks the old one `status: superseded`, `superseded_by: <new id>`. The old episode stays in the graph so the history survives.
 
 By default `search_memory` leaves out graph facts with `invalid_at` set, superseded memories, and graph facts whose every source memory is superseded, so a missed invalidation can't make an old source look current. `include_history=true` brings them back.
+
+### Deleting a memory
+
+A memory that must not be kept at all, not even as history, is deleted: remove its Markdown file. FTS drops it on its next call. The next `sync_memory_graph` removes its graph episode and counts it in `removed`. That holds on every machine, so a `git pull` that brings the deletion, followed by `sync-graph`, cleans up the other machines too.
+
+- Graphiti deletes the facts and entities only that memory produced. A fact other memories also support stays, sourced from them alone.
+- Graphiti rewrites the summary of each entity the memory shared with other memories, so a removal makes a few OpenAI calls.
+- A fact the deleted memory had invalidated stays invalidated. Only a graph rebuild brings it back.
+- A file that no longer parses counts as deleted, for FTS and for the graph. Once it's fixed, the next sync ingests it again.
+- A sync that finds no memories at all in the Markdown folder removes nothing and lists each memory it kept in `errors`. An empty folder is far more often a wrong `MEMORY_ROOT` than a vault whose every memory was deleted.
 
 ### Provenance and verification
 

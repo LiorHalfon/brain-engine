@@ -19,11 +19,13 @@ A vault is a folder with a `brain.toml`, its Markdown memories, and a `pyproject
 After anything that changes a working vault's code or state, with the service running:
 
 ```bash
-uv run brain-engine sync-graph --vault <vault>                         # indexed: 0, errors: []
+uv run brain-engine sync-graph --vault <vault>                         # indexed: 0, removed: 0, errors: []
 uv run brain-engine search "<a topic the vault knows>" --vault <vault>  # facts, graph_error: null
 ```
 
 `indexed` counts memories ingested just now. A few means memories written since the last ingest. A count near the vault's size means the graph state didn't carry over: stop the service and find out why before going on.
+
+`removed` counts memories whose Markdown file is gone, removed from the graph just now. A few means files deleted since the last sync, here or in a `git pull`. The first sync on an engine newer than 0.1.1 also removes the memories deleted before it. Errors that say "not removed: <folder> holds no memories" mean the sync found the Markdown folder empty and kept the graph. Check the vault's Markdown folder and `MEMORY_ROOT` before anything else.
 
 ## Setting up a vault
 
@@ -61,4 +63,6 @@ The README's "Changes from the per-vault servers" lists what changes for the vau
 
 ## Cleaning up the graph
 
-Deleting a memory's Markdown file leaves its episode and facts in the graph, and the engine has no command that removes them. For a memory that was wrong, `correct_memory` hides facts whose every source is superseded. Facts from deleted memories go only with a rebuild: stop the service, move `graphiti.db` and `graph-state.sqlite3` aside, and start it again. It ingests every memory, so the rebuild rule above applies.
+For a memory that was wrong, `correct_memory` keeps the history and hides facts whose every source is superseded. For a memory that must not be kept at all, delete its Markdown file and run `sync-graph`. It removes the memory's episode with the facts and entities only that memory produced, and counts it in `removed`. Every machine's next sync does the same, so a deletion pulled from git cleans up there too. The README's "Deleting a memory" lists what a removal leaves behind.
+
+A fact the deleted memory had invalidated stays invalidated. Only a rebuild brings it back: stop the service, move `graphiti.db` and `graph-state.sqlite3` aside, and start it again. It ingests every memory, so the rebuild rule above applies.

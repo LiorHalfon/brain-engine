@@ -204,7 +204,7 @@ def create_server(service: MemoryService, settings: Settings) -> MCPServer:
 
     @mcp.tool()
     async def sync_memory_graph() -> dict:
-        """Ingest searchable Markdown memories not yet represented in Graphiti."""
+        """Ingest searchable Markdown memories not yet represented in Graphiti, and remove those whose file was deleted."""
         return await service.sync_graph()
 
     return mcp

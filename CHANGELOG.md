@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `sync-graph` and `sync_memory_graph` remove the graph episode of every memory whose Markdown file is gone, and count them as `removed` next to `indexed`. Graphiti deletes the facts and entities only that memory produced. The first sync after upgrading also removes memories deleted before it. No migration: the state format is unchanged.
+- A sync that finds no memories in the Markdown folder removes nothing and lists each memory it kept in `errors`, since an empty folder usually means a wrong `MEMORY_ROOT`.
+
 ## 0.1.1
 
 - `skills/brain-engine/` is a skill for the agents that set up, move, upgrade or troubleshoot a vault. The README's "Agent skill" section shows how a vault installs it.

@@ -60,7 +60,7 @@ def main() -> None:
     sub.add_parser("serve", parents=[vault_arg], help="run the long-lived Streamable HTTP MCP service")
     sub.add_parser("stdio", parents=[vault_arg], help="legacy: run a single-client MCP server over stdio")
     sub.add_parser("reindex", parents=[vault_arg], help="rebuild the FTS5 index from Markdown")
-    sub.add_parser("sync-graph", parents=[vault_arg], help="ingest new/edited Markdown into Graphiti")
+    sub.add_parser("sync-graph", parents=[vault_arg], help="ingest new/edited Markdown into Graphiti, remove deleted memories")
     search = sub.add_parser("search", parents=[vault_arg], help="search memory, through the service if it runs")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=5)

@@ -208,6 +208,19 @@ async def test_cli_graph_commands_use_the_running_service(tmp_path: Path) -> Non
     assert [m["id"] for m in found["memories"]] == [created["id"]]
 
 
+async def test_cli_sync_graph_removes_deleted_memories_through_the_running_service(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    graph = FakeGraph()
+    async with running_service(settings, graph) as service:
+        service.store.remember(title="Snacks", content="The team prefers oat crackers.")
+        deleted = service.store.remember(title="Drinks", content="The team prefers mint tea.")
+        await _run_graph_command(settings, "sync_memory_graph", {})
+        (settings.memory_dir / deleted["path"]).unlink()
+        synced = await _run_graph_command(settings, "sync_memory_graph", {})
+    assert synced["removed"] == 1 and synced["errors"] == []
+    assert deleted["id"] not in graph.memory_ids()
+
+
 async def test_port_in_use_fails_clearly_without_starting_graph(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     graph = FakeGraph()
