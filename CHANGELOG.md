@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 - `sync-graph` and `sync_memory_graph` remove the graph episode of every memory whose Markdown file is gone, and count them as `removed` next to `indexed`. Graphiti deletes the facts and entities only that memory produced. The first sync after upgrading also removes memories deleted before it. No migration: the state format is unchanged.
 - A sync keeps the graph, and reports it as one `errors` entry with no `memory_id`, when a Markdown file doesn't parse, when the folder holds no memories, or when more than 20 memories look deleted at once. `sync-graph --allow-mass-removal`, or `allow_mass_removal=true` on the tool, goes past the last two.

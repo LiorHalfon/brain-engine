@@ -107,7 +107,7 @@ brain-engine isn't on PyPI. A vault installs a tag straight from GitHub with [uv
 name = "my-vault"
 version = "0"
 requires-python = ">=3.12"
-dependencies = ["brain-engine[graph] @ git+https://github.com/LiorHalfon/brain-engine@v0.1.1"]
+dependencies = ["brain-engine[graph] @ git+https://github.com/LiorHalfon/brain-engine@v0.1.2"]
 
 [tool.uv]
 package = false
