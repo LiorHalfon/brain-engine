@@ -221,6 +221,52 @@ async def test_cli_sync_graph_removes_deleted_memories_through_the_running_servi
     assert deleted["id"] not in graph.memory_ids()
 
 
+async def test_cli_sync_graph_passes_the_go_ahead_to_the_running_service(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    graph = FakeGraph()
+    async with running_service(settings, graph) as service:
+        created = service.store.remember(title="Drinks", content="The team prefers mint tea.")
+        await _run_graph_command(settings, "sync_memory_graph", {})
+        (settings.memory_dir / created["path"]).unlink()
+        held_back = await _run_graph_command(settings, "sync_memory_graph", {})
+        gone_ahead = await _run_graph_command(settings, "sync_memory_graph", {"allow_mass_removal": True})
+    assert held_back["removed"] == 0 and gone_ahead["removed"] == 1
+
+
+async def test_cli_sync_graph_passes_the_go_ahead_when_no_service_runs(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    graph = FakeGraph()
+    created = store.remember(title="Drinks", content="The team prefers mint tea.")
+    await graph.ingest(store.record(created["id"]))
+    (settings.memory_dir / created["path"]).unlink()
+    monkeypatch.setattr(MemoryService, "from_settings", staticmethod(lambda settings: MemoryService(store, graph)))
+
+    synced = await _run_graph_command(settings, "sync_memory_graph", {"allow_mass_removal": True})
+
+    assert synced["removed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("flags", "arguments"),
+    [([], {}), (["--allow-mass-removal"], {"allow_mass_removal": True})],
+)
+def test_sync_graph_sends_the_go_ahead_only_when_given(tmp_path: Path, monkeypatch, flags, arguments) -> None:
+    # A service still on an older engine has no such argument, so a plain sync must not send it.
+    calls = []
+
+    async def recorded(settings: Settings, tool: str, sent: dict) -> dict:
+        calls.append((tool, sent))
+        return {}
+
+    monkeypatch.setattr(cli, "_run_graph_command", recorded)
+    monkeypatch.setattr(sys, "argv", ["brain-engine", "sync-graph", "--vault", str(make_vault(tmp_path)), *flags])
+
+    cli.main()
+
+    assert calls == [("sync_memory_graph", arguments)]
+
+
 async def test_port_in_use_fails_clearly_without_starting_graph(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     graph = FakeGraph()

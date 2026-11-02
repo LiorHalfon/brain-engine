@@ -25,7 +25,12 @@ uv run brain-engine search "<a topic the vault knows>" --vault <vault>  # facts,
 
 `indexed` counts memories ingested just now. A few means memories written since the last ingest. A count near the vault's size means the graph state didn't carry over: stop the service and find out why before going on.
 
-`removed` counts memories whose Markdown file is gone, removed from the graph just now. A few means files deleted since the last sync, here or in a `git pull`. The first sync on an engine newer than 0.1.1 also removes the memories deleted before it. Errors that say "not removed: <folder> holds no memories" mean the sync found the Markdown folder empty and kept the graph. Check the vault's Markdown folder and `MEMORY_ROOT` before anything else.
+`removed` counts memories whose Markdown file is gone, removed from the graph just now. A few means files deleted since the last sync, here or in a `git pull`. The first sync on an engine newer than 0.1.1 also removes the memories deleted before it.
+
+A `not removed` error means the sync kept the graph because the Markdown folder looks wrong:
+
+- "not removed: <folder> holds no memories" or "not removed: <n> memories look deleted": check the vault's Markdown folder, `MEMORY_ROOT` and the checkout's branch before anything else. Run `sync-graph --allow-mass-removal` only once the user confirms those memories really were deleted.
+- "not removed: these files don't parse": fix the files it names, or delete them if they hold no memory. The next sync carries on, and a fixed file needs no new ingest.
 
 ## Setting up a vault
 
@@ -63,6 +68,6 @@ The README's "Changes from the per-vault servers" lists what changes for the vau
 
 ## Cleaning up the graph
 
-For a memory that was wrong, `correct_memory` keeps the history and hides facts whose every source is superseded. For a memory that must not be kept at all, delete its Markdown file and run `sync-graph`. It removes the memory's episode with the facts and entities only that memory produced, and counts it in `removed`. Every machine's next sync does the same, so a deletion pulled from git cleans up there too. The README's "Deleting a memory" lists what a removal leaves behind.
+For a memory that was wrong, `correct_memory` keeps the history and hides facts whose every source is superseded. For a memory that must not be kept at all, delete its Markdown file and run `sync-graph`. Search stops returning the facts only that memory supports as soon as the file is gone. The sync removes the memory's episode with those facts and entities, and counts it in `removed`. Every machine's next sync does the same, so a deletion pulled from git cleans up there too. The README's "Deleting a memory" lists what a removal leaves behind.
 
 A fact the deleted memory had invalidated stays invalidated. Only a rebuild brings it back: stop the service, move `graphiti.db` and `graph-state.sqlite3` aside, and start it again. It ingests every memory, so the rebuild rule above applies.

@@ -21,7 +21,11 @@ def parse_markdown(path: Path) -> MarkdownDocument:
     if end == -1:
         raise ValueError(f"Unterminated YAML frontmatter: {path}")
     raw_meta = text[4:end]
-    metadata = yaml.safe_load(raw_meta) or {}
+    try:
+        metadata = yaml.safe_load(raw_meta) or {}
+    except yaml.YAMLError as exc:
+        # A typo or conflict markers. Left as is, one such file stopped every call that reads the index.
+        raise ValueError(f"Invalid YAML frontmatter: {path}") from exc
     if not isinstance(metadata, dict):
         raise ValueError(f"Frontmatter must be a mapping: {path}")
     body = text[end + 5 :].lstrip("\n")

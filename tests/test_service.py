@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+from brain_engine import service as service_module
 from brain_engine import store as store_module
 from brain_engine.graph import GraphFact
 from brain_engine.service import MemoryService
@@ -40,8 +41,8 @@ class FakeGraph:
             )
         ][:limit]
 
-    async def remove(self, memory_id: str) -> None:
-        self.records.pop(memory_id, None)
+    async def remove(self, memory_id: str) -> bool:
+        return self.records.pop(memory_id, None) is not None
 
     def memory_ids(self) -> set[str]:
         return set(self.records)
@@ -195,19 +196,133 @@ def test_sync_keeps_the_episodes_of_superseded_memories(tmp_path: Path) -> None:
     assert result["removed"] == 0 and graph.memory_ids() == {old["id"], new["id"]}
 
 
+def _remembered(service: MemoryService, count: int) -> list[dict]:
+    return [run(service.remember(title=f"Fact {i}", content=f"Fact number {i}.", kind="note")) for i in range(count)]
+
+
 def test_sync_removes_nothing_when_the_markdown_folder_is_empty(tmp_path: Path) -> None:
     # A wrong MEMORY_ROOT reads as an empty vault. Removing every episode would cost a full rebuild.
     store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
     graph = FakeGraph()
     service = MemoryService(store, graph)
-    created = run(service.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note"))
-    (store.root / created["path"]).unlink()
+    created = _remembered(service, 2)
+    for memory in created:
+        (store.root / memory["path"]).unlink()
 
     result = run(service.sync_graph())
 
-    assert result["removed"] == 0 and graph.memory_ids() == {created["id"]}
-    assert [error["memory_id"] for error in result["errors"]] == [created["id"]]
-    assert "holds no memories" in result["errors"][0]["error"]
+    message = f"not removed: {store.root} holds no memories"
+    assert result == {"indexed": 0, "removed": 0, "skipped": 0, "errors": [{"error": message}]}
+    assert graph.memory_ids() == {memory["id"] for memory in created}
+    assert _rows(service)[-1]["error"] == message
+
+    assert run(service.sync_graph(allow_mass_removal=True))["removed"] == 2
+    assert graph.memory_ids() == set()
+
+
+def test_sync_removes_up_to_the_limit_without_being_told_to(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "MAX_UNCONFIRMED_REMOVALS", 2)
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+    created = _remembered(service, 3)
+    for memory in created[:2]:
+        (store.root / memory["path"]).unlink()
+
+    result = run(service.sync_graph())
+
+    assert result["removed"] == 2 and result["errors"] == []
+    assert graph.memory_ids() == {created[2]["id"]}
+
+
+def test_sync_keeps_the_graph_past_the_limit_until_told_to_go_ahead(tmp_path: Path, monkeypatch) -> None:
+    # A checkout on an older commit, or a MEMORY_ROOT at a subfolder, still holds some memories. Each
+    # one removed by mistake costs a new ingest once the folder is right.
+    monkeypatch.setattr(service_module, "MAX_UNCONFIRMED_REMOVALS", 2)
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+    created = _remembered(service, 4)
+    for memory in created[:3]:
+        (store.root / memory["path"]).unlink()
+
+    result = run(service.sync_graph())
+
+    assert result["removed"] == 0 and graph.memory_ids() == {memory["id"] for memory in created}
+    assert len(result["errors"]) == 1 and "--allow-mass-removal" in result["errors"][0]["error"]
+
+    assert run(service.sync_graph(allow_mass_removal=True)) == {"indexed": 1, "removed": 3, "skipped": 0, "errors": []}
+    assert graph.memory_ids() == {created[3]["id"]}
+
+
+def test_a_file_that_no_longer_parses_is_not_taken_for_a_deleted_memory(tmp_path: Path) -> None:
+    # Conflict markers or a YAML typo in the frontmatter. Fixing the file must not cost a new ingest.
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+    broken, deleted, other = _remembered(service, 3)
+    path = store.root / broken["path"]
+    good_text = path.read_text(encoding="utf-8")
+    path.write_text("---\nid: [unclosed\n---\n\nSome text.\n", encoding="utf-8")
+    (store.root / deleted["path"]).unlink()
+
+    for go_ahead in (False, True):  # a broken file holds removals back either way
+        result = run(service.sync_graph(allow_mass_removal=go_ahead))
+        assert result["removed"] == 0
+        assert len(result["errors"]) == 1 and broken["path"] in result["errors"][0]["error"]
+    assert graph.memory_ids() == {broken["id"], deleted["id"], other["id"]}
+
+    path.write_text(good_text, encoding="utf-8")
+    result = run(service.sync_graph())
+
+    assert result["removed"] == 1 and result["errors"] == []
+    assert graph.memory_ids() == {broken["id"], other["id"]}
+
+
+def test_a_stray_file_that_does_not_parse_is_no_error_while_nothing_looks_deleted(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    service = MemoryService(store, FakeGraph())
+    _remembered(service, 1)
+    (store.root / "scratch.md").write_text("Notes without frontmatter.\n", encoding="utf-8")
+
+    assert run(service.sync_graph())["errors"] == []
+
+
+def test_search_hides_the_facts_of_a_memory_deleted_since_the_last_sync(tmp_path: Path) -> None:
+    # The episode stays in the graph until a sync, but FTS has already dropped the memory.
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+    created = _remembered(service, 1)[0]
+    assert run(service.search("Parcelco"))["facts"]
+
+    (store.root / created["path"]).unlink()
+
+    assert run(service.search("Parcelco"))["facts"] == []
+    assert run(service.search("Parcelco", include_history=True))["facts"]
+    assert [edge["current"] for edge in run(service.graph_snapshot())["edges"]] == [False]
+    assert created["id"] in graph.memory_ids()
+
+
+def test_search_keeps_a_fact_while_a_remaining_memory_supports_it(tmp_path: Path) -> None:
+    class SharedFact(FakeGraph):
+        async def search(self, query: str, limit: int = 5, include_invalidated: bool = False) -> list[GraphFact]:
+            facts = await super().search(query, limit, include_invalidated)
+            return [GraphFact(**{**fact.__dict__, "source_memory_ids": list(self.records)}) for fact in facts]
+
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    service = MemoryService(store, SharedFact())
+    deleted, _ = _remembered(service, 2)
+    (store.root / deleted["path"]).unlink()
+
+    assert run(service.search("Parcelco"))["facts"]
+
+
+def test_search_keeps_a_fact_with_no_known_source(tmp_path: Path) -> None:
+    # Graph-state has no row for its episodes, so nothing says its source is gone.
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+
+    assert run(MemoryService(store, FakeGraph()).search("Parcelco"))["facts"]
 
 
 def test_graph_snapshot_reads_each_memory_once(tmp_path: Path, monkeypatch) -> None:

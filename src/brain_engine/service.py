@@ -14,6 +14,10 @@ from brain_engine.store import MemoryStore, SearchResult
 
 logger = logging.getLogger(__name__)
 
+# A memory removed by mistake comes back only through a new ingest, about 20 s of OpenAI calls. This
+# caps what a wrong Markdown folder can cost a sync that nobody told to remove more.
+MAX_UNCONFIRMED_REMOVALS = 20
+
 
 class MemoryService:
     def __init__(self, store: MemoryStore, graph: GraphBackend, metrics: Metrics | None = None) -> None:
@@ -165,7 +169,7 @@ class MemoryService:
                         continue
                     seen_facts.add(normalized)
 
-                    if not include_history and self._all_sources_superseded(fact.source_memory_ids):
+                    if not include_history and self._has_no_current_source(fact.source_memory_ids):
                         continue
 
                     graph_results.append(fact)
@@ -182,9 +186,9 @@ class MemoryService:
                 "graph_error": graph_error,
             }
 
-    def _all_sources_superseded(self, memory_ids: list[str]) -> bool:
+    def _has_no_current_source(self, memory_ids: list[str]) -> bool:
         # store.search() has just brought the index up to date, so its statuses are current.
-        return _all_superseded(memory_ids, self.store.statuses(memory_ids))
+        return _no_current_source(memory_ids, self.store.statuses(memory_ids))
 
     async def graph_snapshot(self) -> dict[str, Any]:
         """Entities and facts for the /graph viewer, with `current` decided the same way as search."""
@@ -210,7 +214,7 @@ class MemoryService:
                         "status": statuses[memory_id],
                         "verified_by_user": bool(record.metadata.get("verified_by_user", False)),
                     }
-                edge["current"] = edge["invalid_at"] is None and not _all_superseded(edge["source_memory_ids"], statuses)
+                edge["current"] = edge["invalid_at"] is None and not _no_current_source(edge["source_memory_ids"], statuses)
             return {**snapshot, "memories": memories, "error": None}
 
     def get(self, memory_id: str, offset: int = 0, max_chars: int = 8000) -> dict[str, Any]:
@@ -258,7 +262,29 @@ class MemoryService:
         with self._measure("verify_memory"):
             return self.store.verify(memory_id)
 
-    async def sync_graph(self) -> dict[str, Any]:
+    def _memories_to_remove(self, allow_mass_removal: bool) -> tuple[list[str], str | None]:
+        """The memories whose Markdown file is gone, or why a sync should keep them for now."""
+        if not self.graph.enabled:
+            return [], None
+        on_disk = self.store.ids()
+        gone = sorted(self.graph.memory_ids() - on_disk)
+        if not gone:
+            return [], None
+        unparsed = self.store.unparsed_paths()
+        if unparsed:
+            # A broken file has no id, so it may hold any of them. Once fixed, it needs no new ingest.
+            return [], f"not removed: these files don't parse and may hold the memories that look deleted: {', '.join(unparsed)}"
+        if not allow_mass_removal:
+            if not on_disk:
+                return [], f"not removed: {self.store.root} holds no memories"
+            if len(gone) > MAX_UNCONFIRMED_REMOVALS:
+                return [], (
+                    f"not removed: {len(gone)} memories look deleted, more than the "
+                    f"{MAX_UNCONFIRMED_REMOVALS} a sync removes unasked. If they are, run sync-graph --allow-mass-removal"
+                )
+        return gone, None
+
+    async def sync_graph(self, *, allow_mass_removal: bool = False) -> dict[str, Any]:
         with self._measure("sync_memory_graph") as timing:
             indexed = 0
             removed = 0
@@ -266,18 +292,14 @@ class MemoryService:
             errors: list[dict[str, str]] = []
             # Markdown is authoritative: a memory whose file is gone takes its episode with it.
             # Removals go first, so the ingests below don't resolve entities against their facts.
-            on_disk = self.store.ids()
-            gone = sorted(self.graph.memory_ids() - on_disk) if self.graph.enabled else []
+            gone, held_back = self._memories_to_remove(allow_mass_removal)
+            if held_back:
+                errors.append({"error": held_back})
             for memory_id in gone:
-                if not on_disk:
-                    # More likely a wrong MEMORY_ROOT than every memory deleted, and removing them
-                    # all would cost a full rebuild once the folder is right.
-                    errors.append({"memory_id": memory_id, "error": f"not removed: {self.store.root} holds no memories"})
-                    continue
                 try:
                     with timing.graph():
-                        await self.graph.remove(memory_id)
-                    removed += 1
+                        if await self.graph.remove(memory_id):
+                            removed += 1
                 except Exception as exc:
                     errors.append({"memory_id": memory_id, "error": str(exc)})
             for record in self.store.iter_records(searchable_only=True):
@@ -296,12 +318,11 @@ class MemoryService:
                 except Exception as exc:
                     errors.append({"memory_id": record.id, "error": str(exc)})
             if errors:
-                timing.error = f"{len(errors)} memories failed to sync"
+                timing.error = held_back or f"{len(errors)} memories failed to sync"
             return {"indexed": indexed, "removed": removed, "skipped": skipped, "errors": errors}
 
 
-def _all_superseded(memory_ids: list[str], statuses: dict[str, str]) -> bool:
-    # A local guardrail around Graphiti invalidation: if every known source for a derived
-    # fact is already superseded in Markdown, the fact is not current.
-    known = [statuses[memory_id] for memory_id in memory_ids if memory_id in statuses]
-    return bool(known) and all(status == "superseded" for status in known)
+def _no_current_source(memory_ids: list[str], statuses: dict[str, str]) -> bool:
+    # A local guardrail around Graphiti invalidation: a fact whose every source is superseded in
+    # Markdown, or deleted and waiting for the next sync to remove its episode, is not current.
+    return bool(memory_ids) and all(statuses.get(memory_id) in (None, "superseded") for memory_id in memory_ids)

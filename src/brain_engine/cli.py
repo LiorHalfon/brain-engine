@@ -40,7 +40,7 @@ async def _run_graph_command(settings: Settings, tool: str, arguments: dict[str,
             await service.start()
             try:
                 if tool == "sync_memory_graph":
-                    return await service.sync_graph()
+                    return await service.sync_graph(**arguments)
                 return await service.search(**arguments)
             finally:
                 await service.close()
@@ -60,7 +60,14 @@ def main() -> None:
     sub.add_parser("serve", parents=[vault_arg], help="run the long-lived Streamable HTTP MCP service")
     sub.add_parser("stdio", parents=[vault_arg], help="legacy: run a single-client MCP server over stdio")
     sub.add_parser("reindex", parents=[vault_arg], help="rebuild the FTS5 index from Markdown")
-    sub.add_parser("sync-graph", parents=[vault_arg], help="ingest new/edited Markdown into Graphiti, remove deleted memories")
+    sync_graph = sub.add_parser(
+        "sync-graph", parents=[vault_arg], help="ingest new/edited Markdown into Graphiti, remove deleted memories"
+    )
+    sync_graph.add_argument(
+        "--allow-mass-removal",
+        action="store_true",
+        help="remove the deleted memories even if the Markdown folder is empty or too many are missing",
+    )
     search = sub.add_parser("search", parents=[vault_arg], help="search memory, through the service if it runs")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=5)
@@ -90,7 +97,9 @@ def main() -> None:
             # Reads the service's timings file; safe to run while the service is up.
             print(MemoryService.from_settings(settings).metrics.report(args.days))
         elif args.command == "sync-graph":
-            _print(asyncio.run(_run_graph_command(settings, "sync_memory_graph", {})))
+            # Only when given: a service still on an older engine has no such argument.
+            arguments = {"allow_mass_removal": True} if args.allow_mass_removal else {}
+            _print(asyncio.run(_run_graph_command(settings, "sync_memory_graph", arguments)))
         elif args.command == "search":
             arguments = {"query": args.query, "limit": args.limit, "include_history": args.include_history}
             _print(asyncio.run(_run_graph_command(settings, "search_memory", arguments)))

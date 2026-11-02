@@ -3,7 +3,10 @@
 ## Unreleased
 
 - `sync-graph` and `sync_memory_graph` remove the graph episode of every memory whose Markdown file is gone, and count them as `removed` next to `indexed`. Graphiti deletes the facts and entities only that memory produced. The first sync after upgrading also removes memories deleted before it. No migration: the state format is unchanged.
-- A sync that finds no memories in the Markdown folder removes nothing and lists each memory it kept in `errors`, since an empty folder usually means a wrong `MEMORY_ROOT`.
+- A sync keeps the graph, and reports it as one `errors` entry with no `memory_id`, when a Markdown file doesn't parse, when the folder holds no memories, or when more than 20 memories look deleted at once. `sync-graph --allow-mass-removal`, or `allow_mass_removal=true` on the tool, goes past the last two.
+- `search_memory` and `/graph` no longer treat a fact as current once its every source memory is deleted, even before a sync removes its episode.
+- A YAML error in one file's frontmatter no longer stops every call that reads the index. The file now counts as one that doesn't parse.
+- Graph writes run one at a time, so a removal or a sync's ingest can't overlap a background ingest and bring back or lose facts. `sync-graph` waits its turn while the queue is busy.
 
 ## 0.1.1
 
