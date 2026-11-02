@@ -17,17 +17,25 @@ errors = pytest.importorskip("graphiti_core.errors")
 class FakeGraphiti:
     """Stands in for the Graphiti client. It removes and adds episodes the way Graphiti 0.31 does,
     including NodeNotFoundError for an episode that is already gone, and yields at every call so
-    concurrent ingests interleave. Each episode's text is its one fact, so search finds a fact only
-    while its episode is in the graph."""
+    concurrent ingests interleave, and notes any writes that overlap. Each episode's text is its one
+    fact, so search finds a fact only while its episode is in the graph."""
 
     def __init__(self) -> None:
         self.episodes: dict[str, str] = {}
         self.sources: list[str] = []
         self.added = 0
         self.remove_error: Exception | None = None
+        self.writers = 0
+        self.writes_overlapped = False
+
+    async def _write(self) -> None:
+        self.writers += 1
+        self.writes_overlapped = self.writes_overlapped or self.writers > 1
+        await asyncio.sleep(0)
+        self.writers -= 1
 
     async def remove_episode(self, episode_uuid: str) -> None:
-        await asyncio.sleep(0)
+        await self._write()
         if self.remove_error is not None:
             raise self.remove_error
         if episode_uuid not in self.episodes:
@@ -35,7 +43,7 @@ class FakeGraphiti:
         del self.episodes[episode_uuid]
 
     async def add_episode(self, *, name: str, episode_body: str, **kwargs) -> SimpleNamespace:
-        await asyncio.sleep(0)
+        await self._write()
         self.added += 1
         self.sources.append(kwargs["source_description"])
         episode_uuid = f"ep-{self.added}"
@@ -196,6 +204,58 @@ def test_a_failed_removal_is_tried_again_by_the_next_sync(tmp_path: Path) -> Non
     client.remove_error = None
     assert run(service.sync_graph())["removed"] == 1
     assert run(service.search("Springfield"))["facts"] == []
+
+
+def test_a_removal_waits_for_an_ingest_of_the_same_memory(tmp_path: Path) -> None:
+    store, backend, client = make_backend(tmp_path)
+    created = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    record = store.record(created["id"])
+
+    async def both() -> None:
+        # A queued ingest still running when a sync finds the memory's file gone.
+        await asyncio.gather(backend.ingest(record), backend.remove(created["id"]))
+
+    run(both())
+
+    assert client.episodes == {} and backend._state(created["id"]) is None
+
+
+def test_graph_writes_run_one_at_a_time(tmp_path: Path) -> None:
+    # Graphiti reads the nodes and edges an episode touches, then saves them back by uuid. A second
+    # writer in between can bring back what the first deleted, or lose what it added.
+    store, backend, client = make_backend(tmp_path)
+    deleted = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    first = store.remember(title="Office", content="The Springfield office opens at 9.", kind="note")
+    second = store.remember(title="Mascot", content="Acme's mascot is a heron named Pip.", kind="note")
+    run(backend.ingest(store.record(deleted["id"])))
+
+    async def all_at_once() -> None:
+        await asyncio.gather(
+            backend.remove(deleted["id"]),
+            backend.ingest(store.record(first["id"])),
+            backend.ingest(store.record(second["id"])),
+        )
+
+    run(all_at_once())
+
+    assert client.writes_overlapped is False
+    assert len(client.episodes) == 2
+
+
+def test_overlapping_syncs_count_a_removal_once(tmp_path: Path) -> None:
+    store, backend, client = make_backend(tmp_path)
+    service = MemoryService(store, backend)
+    store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    deleted = store.remember(title="Office", content="The Springfield office opens at 9.", kind="note")
+    run(service.sync_graph())
+    (store.root / deleted["path"]).unlink()
+
+    async def both() -> list[dict]:
+        return await asyncio.gather(service.sync_graph(), service.sync_graph())
+
+    first, second = run(both())
+
+    assert first["removed"] + second["removed"] == 1
 
 
 async def test_close_saves_the_graph_and_stops_its_redis_server(tmp_path: Path, monkeypatch) -> None:

@@ -203,9 +203,13 @@ def create_server(service: MemoryService, settings: Settings) -> MCPServer:
         return service.verify(memory_id)
 
     @mcp.tool()
-    async def sync_memory_graph() -> dict:
-        """Ingest searchable Markdown memories not yet represented in Graphiti, and remove those whose file was deleted."""
-        return await service.sync_graph()
+    async def sync_memory_graph(allow_mass_removal: bool = False) -> dict:
+        """Ingest searchable Markdown memories not yet represented in Graphiti, and remove those whose file was deleted.
+
+        A sync keeps the graph and reports it when the Markdown folder looks wrong: empty, or too many
+        memories missing. Set allow_mass_removal only once the owner confirms they really were deleted.
+        """
+        return await service.sync_graph(allow_mass_removal=allow_mass_removal)
 
     return mcp
 

@@ -227,10 +227,16 @@ class MemoryStore:
 
     def ids(self) -> set[str]:
         """The id of every memory in the Markdown folder, searchable or not. A file that doesn't
-        parse has no id, so its memory is gone from here as it is from search."""
+        parse has no id, so its memory is gone from here as it is from search. `unparsed_paths`
+        lists those files."""
         self.ensure_index()
         with self._connect() as conn:
             return {row["id"] for row in conn.execute("SELECT id FROM documents WHERE id IS NOT NULL")}
+
+    def unparsed_paths(self) -> list[str]:
+        """The Markdown files that don't parse, as of the index's last update."""
+        with self._connect() as conn:
+            return [row["path"] for row in conn.execute("SELECT path FROM documents WHERE id IS NULL ORDER BY path")]
 
     def statuses(self, memory_ids: list[str]) -> dict[str, str]:
         """The status of each id the index knows, as of its last update."""

@@ -42,7 +42,7 @@ class GraphBackend(Protocol):
 
     async def search(self, query: str, limit: int = 5, include_invalidated: bool = False) -> list[GraphFact]: ...
 
-    async def remove(self, memory_id: str) -> None: ...
+    async def remove(self, memory_id: str) -> bool: ...
 
     def memory_ids(self) -> set[str]: ...
 
@@ -63,8 +63,8 @@ class DisabledGraphBackend:
     async def search(self, query: str, limit: int = 5, include_invalidated: bool = False) -> list[GraphFact]:
         return []
 
-    async def remove(self, memory_id: str) -> None:
-        return None
+    async def remove(self, memory_id: str) -> bool:
+        return False
 
     def memory_ids(self) -> set[str]:
         return set()
@@ -105,7 +105,11 @@ class GraphitiBackend:
         self._falkor: Any = None
         # Concurrent requests must not each open their own FalkorDB Lite instance.
         self._client_lock = asyncio.Lock()
-        self._memory_locks: dict[str, asyncio.Lock] = {}
+        # One writer at a time. Graphiti reads the nodes and edges an episode touches, spends seconds
+        # on the LLM, then saves them back by uuid, so a second writer in between can bring back what
+        # the first deleted or lose what it added. It also keeps two ingests of one memory apart: the
+        # second finds the first one's state.
+        self._write_lock = asyncio.Lock()
         self._init_state_db()
 
     def _connect_state(self) -> sqlite3.Connection:
@@ -250,10 +254,7 @@ class GraphitiBackend:
         if not self.enabled or record.metadata.get("searchable", True) is False:
             return {"enabled": self.enabled, "indexed": False, "memory_id": record.id}
 
-        # edit_memory and a sync can reach the same memory at once. Unserialized, both remove the
-        # same old episode and each add a new one. The second waits here and then finds the
-        # first one's state.
-        async with self._memory_locks.setdefault(record.id, asyncio.Lock()):
+        async with self._write_lock:
             return await self._ingest(record)
 
     async def _ingest(self, record: MemoryRecord) -> dict[str, Any]:
@@ -388,19 +389,19 @@ class GraphitiBackend:
         )
         return (await client.search_(query, config=config)).edges
 
-    async def remove(self, memory_id: str) -> None:
-        """Remove the memory's episode and forget the memory.
+    async def remove(self, memory_id: str) -> bool:
+        """Remove the memory's episode and forget the memory. Returns whether it had a row to forget.
 
         Graphiti deletes the facts and entities only this episode produced, drops the episode from
         the sources of facts other episodes share, and asks the LLM to summarize again the entities
         that remain. A fact this episode invalidated stays invalidated. If the removal fails, the
         memory's row stays, so the next sync tries again.
         """
-        # Serialized with ingest, so an ingest in flight can't add an episode after the removal.
-        async with self._memory_locks.setdefault(memory_id, asyncio.Lock()):
+        # Waits for an ingest in flight, which can't then add an episode after the removal.
+        async with self._write_lock:
             previous = self._state(memory_id)
             if previous is None:
-                return
+                return False
             if previous["episode_uuid"]:
                 from graphiti_core.errors import NodeNotFoundError
 
@@ -411,6 +412,7 @@ class GraphitiBackend:
                     pass  # already gone from the graph
             with self._connect_state() as conn:
                 conn.execute("DELETE FROM graph_ingestion WHERE memory_id=?", (memory_id,))
+            return True
 
     def memory_ids(self) -> set[str]:
         """Every memory graph-state has a row for, including ingests that failed."""

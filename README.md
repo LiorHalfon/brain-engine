@@ -162,6 +162,7 @@ A Graphiti ingest takes about 20 seconds of OpenAI calls, against about 40 ms fo
 - A failed ingest is logged and recorded in graph-state and `metrics`, and the queue moves on. The next start retries it.
 - If Graphiti didn't start, writes ingest right away and return the error, rather than queueing work that would fail where nobody sees it.
 - `sync_memory_graph`, and the CLI when no service runs, ingest and remove right away and return counts.
+- The graph takes one write at a time, because Graphiti saves what it read seconds earlier back by uuid. A sync waits for the ingest in flight, and the queue waits for the sync's current write.
 
 ### Stopping
 
@@ -312,17 +313,25 @@ Don't overwrite a memory because reality changed. "The office opens at 9" in Sep
 - `edit_memory` fixes the stored text itself, like a typo. It edits the file in place, clears verification and replaces the graph episode.
 - `correct_memory` records that a memory was wrong. It writes a new memory with `corrects: <old id>` and marks the old one `status: superseded`, `superseded_by: <new id>`. The old episode stays in the graph so the history survives.
 
-By default `search_memory` leaves out graph facts with `invalid_at` set, superseded memories, and graph facts whose every source memory is superseded, so a missed invalidation can't make an old source look current. `include_history=true` brings them back.
+By default `search_memory` leaves out graph facts with `invalid_at` set, superseded memories, and graph facts whose every source memory is superseded or deleted, so a missed invalidation can't make an old source look current. `include_history=true` brings them back.
 
 ### Deleting a memory
 
-A memory that must not be kept at all, not even as history, is deleted: remove its Markdown file. FTS drops it on its next call. The next `sync_memory_graph` removes its graph episode and counts it in `removed`. That holds on every machine, so a `git pull` that brings the deletion, followed by `sync-graph`, cleans up the other machines too.
+A memory that must not be kept at all, not even as history, is deleted: remove its Markdown file. FTS drops it on its next call, and `search_memory` and `/graph` stop treating a fact as current once its every source is gone. The facts stay in the graph, and `include_history=true` still returns them, until the next `sync_memory_graph` removes the memory's episode and counts it in `removed`. That holds on every machine, so a `git pull` that brings the deletion, followed by `sync-graph`, cleans up the other machines too.
 
 - Graphiti deletes the facts and entities only that memory produced. A fact other memories also support stays, sourced from them alone.
 - Graphiti rewrites the summary of each entity the memory shared with other memories, so a removal makes a few OpenAI calls.
 - A fact the deleted memory had invalidated stays invalidated. Only a graph rebuild brings it back.
-- A file that no longer parses counts as deleted, for FTS and for the graph. Once it's fixed, the next sync ingests it again.
-- A sync that finds no memories at all in the Markdown folder removes nothing and lists each memory it kept in `errors`. An empty folder is far more often a wrong `MEMORY_ROOT` than a vault whose every memory was deleted.
+
+Only a sync removes episodes. The service doesn't at start-up: a wrong removal costs a new ingest, and nobody is reading the result at that moment.
+
+A sync keeps the graph when the Markdown folder looks wrong, and reports it as one entry in `errors` with no `memory_id`. Ingests still run.
+
+- A file doesn't parse. It has no id, so it may hold any memory that looks deleted. The error names the files, and removals wait until they are fixed or gone. A fixed file needs no new ingest.
+- The folder holds no memories at all, far more often a wrong `MEMORY_ROOT` than a vault whose every memory was deleted.
+- More than 20 memories look deleted at once, as with a checkout on an older commit or a `MEMORY_ROOT` at a subfolder. Each one removed by mistake costs about 20 seconds of OpenAI calls to bring back, so the limit caps a mistake at about 7 minutes.
+
+When the deletions are real, `sync-graph --allow-mass-removal`, or `sync_memory_graph` with `allow_mass_removal=true`, goes past the last two.
 
 ### Provenance and verification
 

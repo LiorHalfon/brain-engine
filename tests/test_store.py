@@ -133,3 +133,14 @@ def test_an_index_from_before_the_documents_table_is_rebuilt(tmp_path: Path) -> 
     created = store.remember(title="Real", content="A real ghost story.", kind="note")
 
     assert [r.id for r in store.search("ghost")] == [created["id"]]
+
+
+def test_a_yaml_error_in_one_file_does_not_stop_the_others(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    created = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    conflicted = "---\nid: note-1\n<<<<<<< HEAD\ntitle: Ours\n=======\ntitle: Theirs\n>>>>>>> main\n---\n\nText.\n"
+    (store.root / "conflicted.md").write_text(conflicted, encoding="utf-8")
+
+    assert [result.id for result in store.search("Parcelco")] == [created["id"]]
+    assert store.unparsed_paths() == ["conflicted.md"]
+    assert [record.id for record in store.iter_records()] == [created["id"]]
