@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -270,6 +271,11 @@ async def test_close_saves_the_graph_and_stops_its_redis_server(tmp_path: Path, 
     try:
         await backend._client.driver.execute_query("CREATE (:Probe {name: 'kept'})")
         await backend.close()
+        # The server drops its connection as it exits. On Linux its pid then stays in the process
+        # table, as a zombie, until init reaps it.
+        deadline = time.monotonic() + 5
+        while psutil.pid_exists(pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
         assert not psutil.pid_exists(pid), "redis-server still running after close"
     finally:
         if psutil.pid_exists(pid):
