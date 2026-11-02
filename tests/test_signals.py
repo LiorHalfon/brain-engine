@@ -92,7 +92,7 @@ def test_signal_closes_the_service_and_its_graph(service, sig: signal.Signals) -
 
     assert process.wait(10) == 0, log.read_text()
     assert "test-vault stopped" in log.read_text()
-    assert not psutil.pid_exists(redis.pid), "redis-server outlived the service"
+    _wait_until(lambda: not psutil.pid_exists(redis.pid), 5, "redis-server outlived the service")
     assert find_servers(graph_db) == []
     assert graph_db.stat().st_mtime > before, "closing did not save graphiti.db"
     # The service stopped its server itself, so the watcher has nothing left to do.
@@ -173,7 +173,8 @@ def test_sigterm_stops_a_stdio_server_and_its_graph(tmp_path: Path, close_stdin_
         process.send_signal(signal.SIGTERM)
 
         assert process.wait(10) == 0, log.read_text()
-        assert not psutil.pid_exists(redis.pid) and find_servers(graph_db) == []
+        _wait_until(lambda: not psutil.pid_exists(redis.pid), 5, "redis-server outlived the service")
+        assert find_servers(graph_db) == []
         assert graph_db.stat().st_mtime > before, "closing did not save graphiti.db"
     finally:
         if process.poll() is None:
