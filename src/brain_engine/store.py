@@ -6,12 +6,14 @@ import sqlite3
 import unicodedata
 import uuid
 from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from brain_engine.config import DEFAULT_KINDS
+from brain_engine.db import connection
 from brain_engine.markdown import MarkdownDocument, parse_markdown, render_markdown
 
 
@@ -95,10 +97,8 @@ class MemoryStore:
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
+        return connection(self.db_path)
 
     def _init_db(self) -> None:
         with self._connect() as conn:

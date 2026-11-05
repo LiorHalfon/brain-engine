@@ -4,12 +4,14 @@ import asyncio
 import logging
 import os
 import sqlite3
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from brain_engine.config import DEFAULT_GRAPH_MODEL
+from brain_engine.db import connection
 from brain_engine.leftovers import stop_leftover_servers
 from brain_engine.watchdog import start_watchdog
 from brain_engine.store import MemoryRecord, content_sha256
@@ -112,10 +114,8 @@ class GraphitiBackend:
         self._write_lock = asyncio.Lock()
         self._init_state_db()
 
-    def _connect_state(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.state_db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect_state(self) -> AbstractContextManager[sqlite3.Connection]:
+        return connection(self.state_db_path)
 
     def _init_state_db(self) -> None:
         with self._connect_state() as conn:
