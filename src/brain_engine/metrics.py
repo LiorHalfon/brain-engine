@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from brain_engine.db import connection
+
 logger = logging.getLogger(__name__)
 
 # Report order: the MCP tools first, then the service's background graph ingest and the graph viewer.
@@ -62,7 +64,7 @@ class Metrics:
     def __init__(self, state_dir: Path) -> None:
         self.db_path = state_dir / "metrics.sqlite3"
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connection(self.db_path) as conn:
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS operations (
@@ -98,7 +100,7 @@ class Metrics:
     ) -> None:
         # Recording must never fail the operation it measures.
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connection(self.db_path) as conn:
                 conn.execute(
                     "INSERT INTO operations(at,op,total_ms,store_ms,graph_ms,memories,chars,error) "
                     "VALUES (?,?,?,?,?,?,?,?)",
@@ -119,8 +121,7 @@ class Metrics:
     def report(self, days: int = 30) -> str:
         since = datetime.now(timezone.utc) - timedelta(days=days)
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
+            with connection(self.db_path) as conn:
                 rows = conn.execute(
                     "SELECT * FROM operations WHERE at >= ? ORDER BY at", (since.isoformat(timespec="seconds"),)
                 ).fetchall()

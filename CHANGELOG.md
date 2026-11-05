@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Every SQLite connection is closed as soon as its transaction ends. `with sqlite3.connect(path)` only commits, so each one kept its file descriptor until Python's cyclic garbage collector ran, and a sync opens one per memory. On a vault of about 400 memories a service spiked to about 250 open files on every sync and held up to 200 while idle. Under launchd's default limit of 256 that failed with `Too many open files`, or `unable to open database file`. The same load now peaks at about 55. No migration: the state format is unchanged.
+
 ## 0.1.2
 
 - `sync-graph` and `sync_memory_graph` remove the graph episode of every memory whose Markdown file is gone, and count them as `removed` next to `indexed`. Graphiti deletes the facts and entities only that memory produced. The first sync after upgrading also removes memories deleted before it. No migration: the state format is unchanged.
