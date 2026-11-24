@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,6 +289,69 @@ async def test_close_saves_the_graph_and_stops_its_redis_server(tmp_path: Path, 
     finally:
         await reopened.close()
     assert [record["name"] for record in records] == ["kept"]
+
+
+def _watchers_of(socket_file: str) -> list[int]:
+    psutil = pytest.importorskip("psutil")
+    return [
+        p.pid
+        for p in psutil.process_iter(["cmdline"])
+        if "brain_engine.watchdog" in (p.info["cmdline"] or []) and socket_file in (p.info["cmdline"] or [])
+    ]
+
+
+async def _until(condition, what: str, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise TimeoutError(what)
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.parametrize("how", ["stopped", "crashed"])
+async def test_the_graph_opens_again_when_its_redis_server_is_gone(tmp_path: Path, monkeypatch, caplog, how: str) -> None:
+    # A server stopped under a running service left every call failing with "No such file or
+    # directory", and one that crashed with "Connection refused", until someone restarted the service.
+    psutil = pytest.importorskip("psutil")
+    import signal
+
+    from redis import Redis
+
+    from brain_engine.leftovers import find_servers
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unused")  # opening the graph makes no OpenAI calls
+    backend = GraphitiBackend(tmp_path)
+    reopened: list[bool] = []
+    backend.on_reopen = lambda: reopened.append(True)
+    await backend.start()
+    try:
+        await backend._client.driver.execute_query("CREATE (:Probe {name: 'kept'})")
+        old_pid, old_socket = backend._falkor.connection.pid, backend._server_socket
+        (old_watcher,) = _watchers_of(old_socket)
+        if how == "stopped":
+            Redis(unix_socket_path=old_socket).shutdown(save=True)  # what the watcher used to do
+        else:
+            os.kill(old_pid, signal.SIGKILL)  # like a segfault, it leaves the socket behind
+        await _until(lambda: not psutil.pid_exists(old_pid), "redis-server did not exit")
+
+        with caplog.at_level(logging.WARNING, logger="brain_engine.graph"):
+            snapshot = await backend.snapshot()
+
+        assert snapshot["enabled"] is True
+        assert reopened == [True]
+        assert "Opening the graph again on a new one" in caplog.text
+        new_pid = backend._falkor.connection.pid
+        assert new_pid != old_pid and [server.pid for server in find_servers(backend.graph_db_path)] == [new_pid]
+        # The old server's watcher is let go, even with the crashed server's socket still there.
+        await _until(lambda: not psutil.pid_exists(old_watcher), "the old server's watcher outlived it")
+        assert len(_watchers_of(backend._server_socket)) == 1
+        if how == "stopped":
+            records, _, _ = await backend._client.driver.execute_query("MATCH (p:Probe) RETURN p.name AS name")
+            assert [record["name"] for record in records] == ["kept"]
+        assert (await backend.snapshot())["enabled"] is True and reopened == [True]  # opens once
+    finally:
+        await backend.close()
+    assert find_servers(backend.graph_db_path) == []
 
 
 async def test_memories_whose_episode_is_gone_are_ingested_again(tmp_path: Path, monkeypatch, caplog) -> None:

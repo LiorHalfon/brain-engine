@@ -66,6 +66,10 @@ The README's "Changes from the per-vault servers" lists what changes for the vau
 - **A redis-server that "doesn't answer"**: it may still be saving. Wait a minute and start again.
 - **"Graphiti unavailable, serving Markdown/FTS only"** in the log: the service is up without graph facts. The rest of that line gives the reason, usually a missing `OPENAI_API_KEY`.
 
+## When search returns a graph_error about the redis socket
+
+`No such file or directory` or `Connection refused` on the redis-server's socket means the graph's server is gone. From 0.1.4 the service opens the graph again on the next graph call and logs "Opening the graph again on a new one", with the last line of the server's log. It then ingests again whatever the new server lacks. Run the `search` proof check twice: the second should show `graph_error: null`. On an older tag the error lasts until a restart, so ask the user to restart the service, then suggest the upgrade. `watchdog.log` in the state folder lists each server the watcher stopped, and why.
+
 ## Cleaning up the graph
 
 For a memory that was wrong, `correct_memory` keeps the history and hides facts whose every source is superseded. For a memory that must not be kept at all, delete its Markdown file and run `sync-graph`. Search stops returning the facts only that memory supports as soon as the file is gone. The sync removes the memory's episode with those facts and entities, and counts it in `removed`. Every machine's next sync does the same, so a deletion pulled from git cleans up there too. The README's "Deleting a memory" lists what a removal leaves behind.

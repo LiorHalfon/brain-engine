@@ -428,6 +428,25 @@ def test_start_queues_the_memories_sync_would_ingest(tmp_path: Path) -> None:
     assert graph.ingested == [new["id"]]
 
 
+def test_a_graph_that_opens_again_gets_every_memory_queued(tmp_path: Path) -> None:
+    # Its new redis-server lacks what the old one had not saved, and ingests that failed meanwhile.
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    memory = store.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note")
+    graph = FakeGraph()
+    service = MemoryService(store, graph)
+
+    async def scenario() -> None:
+        await service.start(ingest_in_background=True)
+        await asyncio.wait_for(service.graph_idle(), 1)
+        graph.on_reopen()
+        await asyncio.wait_for(service.graph_idle(), 1)
+        await service.close()
+
+    run(scenario())
+    assert graph.ingested == [memory["id"], memory["id"]]
+    assert graph.on_reopen is None
+
+
 def test_close_does_not_wait_for_a_running_ingest(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")

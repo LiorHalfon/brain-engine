@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sqlite3
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,7 +15,7 @@ from typing import Any, Protocol
 from brain_engine.config import DEFAULT_GRAPH_MODEL
 from brain_engine.db import connection
 from brain_engine.leftovers import stop_leftover_servers
-from brain_engine.watchdog import start_watchdog
+from brain_engine.watchdog import LOG_NAME, Watchdog, start_watchdog
 from brain_engine.store import MemoryRecord, content_sha256
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ class GraphFact:
 
 class GraphBackend(Protocol):
     enabled: bool
+    # Called after the graph opens again on a new redis-server, which may lack the latest writes.
+    on_reopen: Callable[[], None] | None
 
     async def start(self) -> None: ...
 
@@ -55,6 +59,7 @@ class GraphBackend(Protocol):
 
 class DisabledGraphBackend:
     enabled = False
+    on_reopen = None
 
     async def start(self) -> None:
         return None
@@ -103,8 +108,15 @@ class GraphitiBackend:
         self.graph_db_path = self.state_dir / "graphiti.db"
         self.state_db_path = self.state_dir / "graph-state.sqlite3"
         self.enabled = enabled
+        self.on_reopen: Callable[[], None] | None = None
         self._client: Any = None
         self._falkor: Any = None
+        # The redis-server this backend started: its socket, its psutil.Process, and its watcher.
+        self._server_socket: str | None = None
+        self._server: Any = None
+        self._watchdog: Watchdog | None = None
+        # Set when the server went away, until the graph is open again on a new one.
+        self._reopening = False
         # Concurrent requests must not each open their own FalkorDB Lite instance.
         self._client_lock = asyncio.Lock()
         # One writer at a time. Graphiti reads the nodes and edges an episode touches, spends seconds
@@ -141,9 +153,50 @@ class GraphitiBackend:
         if not self.enabled:
             raise RuntimeError("Graphiti is disabled")
         async with self._client_lock:
+            if self._client is not None and (gone := self._server_gone()):
+                # Every call would fail until a restart, with "No such file or directory" for a
+                # server that was stopped and "Connection refused" for one that crashed.
+                logger.warning("The graph's redis-server %s. Opening the graph again on a new one.%s", gone, self._server_log_tail())
+                client, self._client = self._client, None
+                with contextlib.suppress(Exception):
+                    await client.close()  # only drops its connections, which are dead
+                self._reopening = True
             if self._client is None:
                 self._client = await self._create_client()
+                if self._reopening:
+                    self._reopening = False
+                    if self.on_reopen is not None:
+                        self.on_reopen()
             return self._client
+
+    def _server_gone(self) -> str | None:
+        """Why the redis-server this backend started can't serve it any more, or None while it can."""
+        if self._server_socket is None:
+            return None  # nothing started here, or a stand-in client
+        if self._server is not None and not self._server.is_running():
+            return f"(pid {self._server.pid}) is no longer running"
+        if not os.path.exists(self._server_socket):
+            return f"socket {self._server_socket} is gone"
+        return None
+
+    def _server_log_tail(self) -> str:
+        # redislite keeps the server's log beside its socket, in a temp folder macOS empties after
+        # a few days, so quote its last line while it is there.
+        if self._server_socket is None:
+            return ""
+        log = Path(self._server_socket).with_name("redis.log")
+        try:
+            lines = [line.strip() for line in log.read_text(errors="replace").splitlines() if line.strip()]
+        except OSError:
+            return ""
+        return f" Its log {log} ends: {lines[-1]}" if lines else ""
+
+    def _forget_server(self) -> None:
+        """Forget the redis-server this backend started, and let its watcher go."""
+        if self._watchdog is not None:
+            self._watchdog.release()
+            self._watchdog = None
+        self._falkor = self._server = self._server_socket = None
 
     async def _create_client(self) -> Any:
         if not os.environ.get("OPENAI_API_KEY"):
@@ -163,14 +216,18 @@ class GraphitiBackend:
             ) from exc
 
         stop_leftover_servers(self.graph_db_path)
+        # The server an earlier open started, gone or left half-open, is stopped now too.
+        self._forget_server()
         # redislite reattaches to the server its registry file names if that process still runs. No
         # server for this graph is left now, so the registry is stale; in a copied state dir it names
         # another vault's server.
         self.graph_db_path.with_name(self.graph_db_path.name + ".settings").unlink(missing_ok=True)
         falkor = AsyncFalkorDB(dbfilename=str(self.graph_db_path))
         self._falkor = falkor
+        self._server_socket = falkor.connection.socket_file
+        self._server = self._server_process(falkor.connection.pid)
         try:
-            start_watchdog(falkor.connection.socket_file)
+            self._watchdog = start_watchdog(self._server_socket, self.state_dir / LOG_NAME)
         except Exception as exc:
             logger.warning("No watcher for the graph's redis-server; a killed service will leave it running: %s", exc)
         driver = FalkorDriver(falkor_db=falkor)
@@ -178,6 +235,17 @@ class GraphitiBackend:
         await client.build_indices_and_constraints()
         await self._forget_missing_episodes(client)
         return client
+
+    @staticmethod
+    def _server_process(pid: int | None) -> Any:
+        # psutil.Process.is_running() checks the pid against the process's start time since boot,
+        # which a clock change doesn't move, so it can't mistake a reused pid for the server.
+        import psutil
+
+        try:
+            return psutil.Process(pid) if pid else None
+        except psutil.NoSuchProcess:
+            return None
 
     async def _forget_missing_episodes(self, client: Any) -> int:
         """Mark memories whose episode is no longer in the graph as not ingested.
@@ -457,12 +525,16 @@ class GraphitiBackend:
 
     async def close(self) -> None:
         if self._falkor is not None:
-            try:
-                await asyncio.wait_for(self._stop_redis(self._falkor.connection.socket_file), CLOSE_TIMEOUT_SECONDS)
-            except TimeoutError:
-                # Its watcher stops it once this process is gone, and the next start would too.
-                logger.warning("The graph's redis-server did not stop within %ss", CLOSE_TIMEOUT_SECONDS)
-            self._falkor = None
+            if not self._server_gone():
+                try:
+                    await asyncio.wait_for(self._stop_redis(self._falkor.connection.socket_file), CLOSE_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    logger.warning("The graph's redis-server did not stop within %ss", CLOSE_TIMEOUT_SECONDS)
+            if not self._server_gone():
+                # Keep the watcher's pipe open: it stops the server once this process is gone, and
+                # the next start would too.
+                self._watchdog = None
+            self._forget_server()
         if self._client is not None:
             await self._client.close()
             self._client = None
