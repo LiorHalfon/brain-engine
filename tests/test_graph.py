@@ -92,12 +92,31 @@ def test_episode_source_is_the_vault_name_and_path(tmp_path: Path) -> None:
 
 def test_backend_hands_its_models_to_the_llm_client(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "unused")  # building the client makes no OpenAI calls
+    openai = GraphitiBackend._openai_client()
 
-    chosen = GraphitiBackend(tmp_path / "a", model="m-big", small_model="m-small")._llm_client()
-    default = GraphitiBackend(tmp_path / "b")._llm_client()
+    chosen = GraphitiBackend(tmp_path / "a", model="m-big", small_model="m-small")._llm_client(openai)
+    default = GraphitiBackend(tmp_path / "b")._llm_client(openai)
 
     assert (chosen.model, chosen.small_model) == ("m-big", "m-small")
     assert (default.model, default.small_model) == ("gpt-6-luna", "gpt-6-luna")
+    assert chosen.client is openai
+
+
+def test_the_openai_client_keeps_idle_connections_open(monkeypatch) -> None:
+    # httpx's default of 5 s closed the connection between almost any two searches, and a new
+    # one's TLS handshake pushed the search past its budget.
+    import openai
+
+    from brain_engine.graph import OPENAI_KEEPALIVE_SECONDS
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unused")
+    built: dict = {}
+    real = openai.DefaultAsyncHttpxClient
+    monkeypatch.setattr(openai, "DefaultAsyncHttpxClient", lambda **kwargs: built.update(kwargs) or real(**kwargs))
+
+    GraphitiBackend._openai_client()
+
+    assert built["limits"].keepalive_expiry == OPENAI_KEEPALIVE_SECONDS >= 60
 
 
 def test_ingest_adds_new_episode_when_old_one_is_already_gone(tmp_path: Path) -> None:
@@ -387,46 +406,113 @@ class SearchGraphiti:
     """Graphiti's two searches: the default hybrid one, which waits on OpenAI to embed the query,
     and `search_` with a config, here only ever asked for the keyword index."""
 
-    def __init__(self, embed_seconds: float) -> None:
+    def __init__(self, embed_seconds: float, error: Exception | None = None) -> None:
         self.embed_seconds = embed_seconds
+        self.error = error
         self.configs: list = []
+        self.hybrid_finished = 0
+        self.hybrid_cancelled = 0
 
     @staticmethod
     def _edge(fact: str) -> SimpleNamespace:
         return SimpleNamespace(uuid=fact, fact=fact, valid_at=None, invalid_at=None, episodes=[])
 
     async def search(self, query: str) -> list:
-        await asyncio.sleep(self.embed_seconds)
+        try:
+            await asyncio.sleep(self.embed_seconds)
+        except asyncio.CancelledError:
+            self.hybrid_cancelled += 1
+            raise
+        if self.error is not None:
+            raise self.error
+        self.hybrid_finished += 1
         return [self._edge("hybrid match")]
 
     async def search_(self, query: str, config) -> SimpleNamespace:
         self.configs.append(config)
         return SimpleNamespace(edges=[self._edge("keyword match")])
 
+    async def close(self) -> None:
+        return None
+
 
 def test_search_uses_the_hybrid_search_when_openai_answers_in_time(tmp_path: Path) -> None:
     backend = GraphitiBackend(tmp_path / "state")
-    backend._client = SearchGraphiti(embed_seconds=0)
+    client = SearchGraphiti(embed_seconds=0)
+    backend._client = client
 
     facts = run(backend.search("office hours"))
 
     assert [fact.fact for fact in facts] == ["hybrid match"]
+    assert facts.keyword_only is False and client.configs == []
 
 
-def test_search_falls_back_to_keywords_when_openai_is_slow(tmp_path: Path) -> None:
+async def test_search_falls_back_to_keywords_when_openai_is_slow(tmp_path: Path, monkeypatch) -> None:
     from graphiti_core.search.search_config import EdgeSearchMethod
 
+    from brain_engine import graph
+
+    monkeypatch.setattr(graph, "SEARCH_BUDGET_SECONDS", 0.05)
+    backend = GraphitiBackend(tmp_path / "state")
+    client = SearchGraphiti(embed_seconds=0.3)
+    backend._client = client
+
+    start = time.monotonic()
+    facts = await backend.search("office hours")
+
+    assert time.monotonic() - start < 0.3
+    assert [fact.fact for fact in facts] == ["keyword match"] and facts.keyword_only is True
+    assert client.configs[0].edge_config.search_methods == [EdgeSearchMethod.bm25]
+    # The late hybrid search goes on: cancelling it would close the connection its OpenAI request
+    # had just opened, so the next search would start cold as well.
+    await asyncio.sleep(0.4)
+    assert (client.hybrid_finished, client.hybrid_cancelled) == (1, 0)
+    assert not backend._unawaited
+
+
+async def test_search_falls_back_to_keywords_when_the_hybrid_search_fails(tmp_path: Path) -> None:
+    backend = GraphitiBackend(tmp_path / "state")
+    backend._client = SearchGraphiti(embed_seconds=0, error=RuntimeError("OpenAI is overloaded"))
+
+    facts = await backend.search("office hours")
+
+    assert [fact.fact for fact in facts] == ["keyword match"] and facts.keyword_only is True
+
+
+async def test_close_cancels_hybrid_searches_still_running(tmp_path: Path, monkeypatch) -> None:
+    from brain_engine import graph
+
+    monkeypatch.setattr(graph, "SEARCH_BUDGET_SECONDS", 0.01)
     backend = GraphitiBackend(tmp_path / "state")
     client = SearchGraphiti(embed_seconds=30)
     backend._client = client
+    await backend.search("office hours")
 
-    async def timed() -> tuple[list, float]:
-        start = asyncio.get_running_loop().time()
-        facts = await backend.search("office hours")
-        return facts, asyncio.get_running_loop().time() - start
+    await asyncio.wait_for(backend.close(), 1)
 
-    facts, seconds = run(timed())
+    assert client.hybrid_cancelled == 1 and not backend._unawaited
 
-    assert [fact.fact for fact in facts] == ["keyword match"]
-    assert seconds < 1
-    assert client.configs[0].edge_config.search_methods == [EdgeSearchMethod.bm25]
+
+def test_ingested_hashes_lists_only_memories_whose_episode_is_in_the_graph(tmp_path: Path) -> None:
+    backend = GraphitiBackend(tmp_path / "state")
+    backend._write_state("mem_ok", "hash-ok", episode_uuid="ep-1", status="ok")
+    backend._write_state("mem_failed", "hash-failed", episode_uuid=None, status="error", error="OpenAI timed out")
+    backend._write_state("mem_lost", "hash-lost", episode_uuid=None, status="missing")
+
+    assert backend.ingested_hashes() == {"mem_ok": "hash-ok"}
+
+
+def test_a_failed_query_is_logged_without_its_parameters(caplog) -> None:
+    # Graphiti logs the query's parameters too, and an embedding is a list of 1,536 numbers.
+    from brain_engine.graph import MAX_LOGGED_QUERY_CHARS
+
+    vector = [0.0123456789] * 1536
+    with caplog.at_level(logging.ERROR, logger="graphiti_core.driver.falkordb_driver"):
+        logging.getLogger("graphiti_core.driver.falkordb_driver").error(
+            f"Error executing FalkorDB query: Error 61 connecting to the socket.\nMATCH (n) RETURN n\n{{'search_vector': {vector}}}"
+        )
+
+    (record,) = caplog.records
+    assert record.getMessage().startswith("Error executing FalkorDB query: Error 61")
+    assert len(record.getMessage()) < MAX_LOGGED_QUERY_CHARS + 50
+    assert "characters cut]" in record.getMessage()

@@ -20,10 +20,35 @@ from brain_engine.store import MemoryRecord, content_sha256
 
 logger = logging.getLogger(__name__)
 
-# Graphiti's default search first has OpenAI embed the query: about 0.25 s on a warm connection, a
-# second or more on a cold one, and as long as OpenAI takes when it is struggling. Past this budget,
-# search answers from the graph's keyword index, which is local and takes about 40 ms.
-SEARCH_BUDGET_SECONDS = 0.5
+# Graphiti's FalkorDB driver logs a failed query with every parameter, embedding vectors included,
+# and the MCP SDK's Rich log handler then gives each number a line of its own, so one failure
+# filled over a thousand lines of the service's log. The error and the query's start are enough.
+MAX_LOGGED_QUERY_CHARS = 1000
+
+
+class _ShortQueryErrors(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if len(message) > MAX_LOGGED_QUERY_CHARS:
+            record.msg = f"{message[:MAX_LOGGED_QUERY_CHARS]} ... [{len(message) - MAX_LOGGED_QUERY_CHARS} characters cut]"
+            record.args = ()
+        return True
+
+
+logging.getLogger("graphiti_core.driver.falkordb_driver").addFilter(_ShortQueryErrors())
+
+# Graphiti's default search first has OpenAI embed the query. On an open connection most searches
+# finish in 0.25-0.45 s. A new connection adds a TLS handshake, and the first search after a pause
+# needs one. With a 0.5 s budget, half of all searches and nearly every first one fell back. Past
+# this budget, search answers from the graph's keyword index, which is local.
+SEARCH_BUDGET_SECONDS = 1.5
+# A hybrid search past its budget goes on in the background for up to this long. Cancelling it
+# would close the connection its OpenAI request had just opened, so the next search would start
+# cold as well.
+LATE_SEARCH_SECONDS = 30
+# How long an idle connection to OpenAI stays open. httpx's default of 5 s closed it between
+# almost any two searches.
+OPENAI_KEEPALIVE_SECONDS = 300
 # Saving a graph takes well under a second; past this, closing gives up rather than hang the exit.
 CLOSE_TIMEOUT_SECONDS = 60
 
@@ -35,6 +60,13 @@ class GraphFact:
     valid_at: str | None
     invalid_at: str | None
     source_memory_ids: list[str]
+
+
+class GraphFacts(list[GraphFact]):
+    """A search's facts. `keyword_only` means they come from the graph's keyword index alone,
+    because the hybrid search missed its budget or failed."""
+
+    keyword_only: bool = False
 
 
 class GraphBackend(Protocol):
@@ -51,6 +83,8 @@ class GraphBackend(Protocol):
     async def remove(self, memory_id: str) -> bool: ...
 
     def memory_ids(self) -> set[str]: ...
+
+    def ingested_hashes(self) -> dict[str, str]: ...
 
     async def snapshot(self) -> dict[str, Any]: ...
 
@@ -75,6 +109,9 @@ class DisabledGraphBackend:
 
     def memory_ids(self) -> set[str]:
         return set()
+
+    def ingested_hashes(self) -> dict[str, str]:
+        return {}
 
     async def snapshot(self) -> dict[str, Any]:
         return {"enabled": False, "nodes": [], "edges": []}
@@ -117,6 +154,9 @@ class GraphitiBackend:
         self._watchdog: Watchdog | None = None
         # Set when the server went away, until the graph is open again on a new one.
         self._reopening = False
+        # Graphiti's OpenAI client, kept across reopens, and searches left to finish in the background.
+        self._openai: Any = None
+        self._unawaited: set[asyncio.Future[Any]] = set()
         # Concurrent requests must not each open their own FalkorDB Lite instance.
         self._client_lock = asyncio.Lock()
         # One writer at a time. Graphiti reads the nodes and edges an episode touches, spends seconds
@@ -209,6 +249,7 @@ class GraphitiBackend:
         try:
             from graphiti_core import Graphiti
             from graphiti_core.driver.falkordb_driver import FalkorDriver
+            from graphiti_core.embedder import OpenAIEmbedder
             from redislite.async_falkordb_client import AsyncFalkorDB
         except ImportError as exc:  # pragma: no cover - depends on optional runtime dependency
             raise RuntimeError(
@@ -231,7 +272,9 @@ class GraphitiBackend:
         except Exception as exc:
             logger.warning("No watcher for the graph's redis-server; a killed service will leave it running: %s", exc)
         driver = FalkorDriver(falkor_db=falkor)
-        client = Graphiti(graph_driver=driver, llm_client=self._llm_client())
+        if self._openai is None:
+            self._openai = self._openai_client()
+        client = Graphiti(graph_driver=driver, llm_client=self._llm_client(self._openai), embedder=OpenAIEmbedder(client=self._openai))
         await client.build_indices_and_constraints()
         await self._forget_missing_episodes(client)
         return client
@@ -270,12 +313,24 @@ class GraphitiBackend:
             logger.warning("Memories marked ingested whose episode is missing from the graph, to be ingested again: %d", len(missing))
         return len(missing)
 
-    def _llm_client(self) -> Any:
+    def _llm_client(self, openai: Any) -> Any:
         # Named explicitly: graphiti-core 0.30.2's default small model was retired by OpenAI, and
-        # every ingest failed with model_not_found. The embedder and reranker keep their defaults.
+        # every ingest failed with model_not_found. The embedder and reranker keep their models.
         from graphiti_core.llm_client import LLMConfig, OpenAIClient
 
-        return OpenAIClient(config=LLMConfig(model=self.model, small_model=self.small_model))
+        return OpenAIClient(config=LLMConfig(model=self.model, small_model=self.small_model), client=openai)
+
+    @staticmethod
+    def _openai_client() -> Any:
+        """The OpenAI client for Graphiti's LLM and embedding calls, which keeps idle connections open."""
+        import openai
+
+        try:
+            import httpx2 as http  # what openai>=3 sends requests with
+        except ImportError:
+            import httpx as http
+        limits = http.Limits(max_connections=1000, max_keepalive_connections=100, keepalive_expiry=OPENAI_KEEPALIVE_SECONDS)
+        return openai.AsyncOpenAI(http_client=openai.DefaultAsyncHttpxClient(limits=limits))
 
     @staticmethod
     def _reference_time(record: MemoryRecord) -> datetime:
@@ -418,11 +473,9 @@ class GraphitiBackend:
         client = await self._get_client()
         # Graphiti's public search returns relationship/fact edges. Slice locally to avoid coupling
         # to a version-specific limit parameter.
-        try:
-            results = await asyncio.wait_for(client.search(query), SEARCH_BUDGET_SECONDS)
-        except TimeoutError:
-            results = await self._keyword_search(client, query)
-        facts: list[GraphFact] = []
+        results, keyword_only = await self._search_edges(client, query)
+        facts = GraphFacts()
+        facts.keyword_only = keyword_only
         for edge in results:
             invalid_at = getattr(edge, "invalid_at", None)
             if invalid_at is not None and not include_invalidated:
@@ -440,6 +493,30 @@ class GraphitiBackend:
             if len(facts) >= max(1, min(limit, 10)):
                 break
         return facts
+
+    async def _search_edges(self, client: Any, query: str) -> tuple[list[Any], bool]:
+        """Graphiti's hybrid search when it answers within the budget, else the keyword index's
+        edges. The second value says which."""
+        hybrid = asyncio.ensure_future(asyncio.wait_for(client.search(query), LATE_SEARCH_SECONDS))
+        try:
+            done, _ = await asyncio.wait({hybrid}, timeout=SEARCH_BUDGET_SECONDS)
+        except asyncio.CancelledError:
+            self._let_finish(hybrid)
+            raise
+        if not done:
+            self._let_finish(hybrid)
+        elif hybrid.exception() is None:
+            return hybrid.result(), False
+        else:
+            # Usually OpenAI. The keyword index needs only the graph, which answers or fails here too.
+            logger.info("Graphiti's hybrid search failed, so search answers from the keyword index: %s", hybrid.exception())
+        return await self._keyword_search(client, query), True
+
+    def _let_finish(self, task: asyncio.Future[Any]) -> None:
+        # Keep a reference so the task runs to the end, and take its error so none is reported unread.
+        self._unawaited.add(task)
+        task.add_done_callback(self._unawaited.discard)
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
 
     @staticmethod
     async def _keyword_search(client: Any, query: str) -> list[Any]:
@@ -487,6 +564,15 @@ class GraphitiBackend:
         with self._connect_state() as conn:
             return {row["memory_id"] for row in conn.execute("SELECT memory_id FROM graph_ingestion")}
 
+    def ingested_hashes(self) -> dict[str, str]:
+        """The content hash of every memory whose episode is in the graph. `ingest` skips a memory
+        whose text still has this hash."""
+        with self._connect_state() as conn:
+            return {
+                row["memory_id"]: row["content_sha256"]
+                for row in conn.execute("SELECT memory_id, content_sha256 FROM graph_ingestion WHERE status='ok'")
+            }
+
     async def snapshot(self) -> dict[str, Any]:
         """All entities and facts, for the read-only /graph viewer. Invalidated facts are included."""
         if not self.enabled:
@@ -524,6 +610,9 @@ class GraphitiBackend:
         }
 
     async def close(self) -> None:
+        for task in list(self._unawaited):
+            task.cancel()
+        await asyncio.gather(*self._unawaited, return_exceptions=True)
         if self._falkor is not None:
             if not self._server_gone():
                 try:
@@ -538,6 +627,9 @@ class GraphitiBackend:
         if self._client is not None:
             await self._client.close()
             self._client = None
+        if self._openai is not None:
+            await self._openai.close()
+            self._openai = None
 
     @staticmethod
     async def _stop_redis(socket_file: str) -> None:

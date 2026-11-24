@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Search gets graph facts from Graphiti's hybrid search far more often. On two vaults' metrics, half of all searches, and nearly every first search after a pause of 5 minutes or more, missed the 0.5 s budget and answered from the keyword index alone. Three things caused it. httpx closed an idle connection to OpenAI after 5 s, so most searches paid for a new TLS handshake. The budget left no room for that handshake. And cancelling a late search closed the connection it had just opened. Now idle OpenAI connections stay open for 5 minutes, and Graphiti's LLM and embedder share them. The budget is 1.5 s, and a search past it still finishes in the background. A hybrid search that fails, usually on OpenAI, also falls back to the keyword index instead of returning no facts.
+- `metrics.sqlite3` records whether each search's graph facts came from the keyword index alone (`keyword_only`), and the service's resident memory on every row (`rss_mb`). An older file gets the two columns when it opens, and its rows keep them empty. `brain-engine metrics` reports the share of keyword-only searches, the median and peak memory, and the most frequent errors of the last 7 days. A graph that had failed every call for days was visible only by reading the rows.
+- `sync-graph`, `sync_memory_graph` and the start-up catch-up compare the index's content hashes with graph-state's, and read only the files of memories the graph lacks. They used to parse every Markdown file: on a vault of 860 memories a sync spent about 0.8 s doing that, and the cost grew with the vault. The counts they return are unchanged.
+- Graphiti's FalkorDB driver logs each failed query with its parameters, including the query's embedding. Under the MCP SDK's log handler that took over a thousand lines per failure, and one vault's log reached 18 MB. Those messages are now cut to 1,000 characters.
+- No migration: the state format is unchanged.
+
 ## 0.1.4
 
 - On macOS the graph's watcher no longer stops the redis-server of a service that is still running. It identified the service by its start time from psutil. psutil 7.2 shifts `create_time()` by a second whenever the system boot time crosses a whole second, and macOS's clock corrections cause that a few times a day. The watcher then took the service for dead and sent its server `SHUTDOWN SAVE`. Every graph call after that failed with `Error 2 connecting to <socket>. No such file or directory.` until the service restarted. The watcher now waits on a pipe whose write end the service holds open. The kernel closes that end however the service exits, so neither clock changes nor reused pids matter.
