@@ -233,6 +233,22 @@ class MemoryStore:
         with self._connect() as conn:
             return {row["id"] for row in conn.execute("SELECT id FROM documents WHERE id IS NOT NULL")}
 
+    def searchable_hashes(self) -> list[tuple[str, str, str]]:
+        """(id, content hash, status) of every searchable memory, in path order, from the index.
+
+        The hash is `content_sha256(type, body)`, the one graph-state keeps, so a sync can tell
+        which memories the graph lacks without parsing every file.
+        """
+        self.ensure_index()
+        with self._connect() as conn:
+            return [
+                (row["id"], row["content_sha256"], row["status"])
+                for row in conn.execute(
+                    "SELECT d.id, d.content_sha256, d.status FROM documents d "
+                    "JOIN memories_fts f ON f.rowid = d.docid ORDER BY d.path"
+                )
+            ]
+
     def unparsed_paths(self) -> list[str]:
         """The Markdown files that don't parse, as of the index's last update."""
         with self._connect() as conn:

@@ -97,6 +97,24 @@ def test_writes_parse_only_the_files_they_change(tmp_path: Path, monkeypatch) ->
     assert len(parsed) == 2
 
 
+def test_searchable_hashes_come_from_the_index_and_match_the_graphs(tmp_path: Path, monkeypatch) -> None:
+    from brain_engine.store import content_sha256
+
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    session = store.remember_session(title="Planning", summary="Acme ships orders with Parcelco.", transcript="Raw words.")
+    old = store.remember(title="Hours", content="The Springfield office opens at 9.", kind="note")
+    new = store.correct(old["id"], "The Springfield office opens at 10.", reason="Hours changed")
+    parsed = _count_parses(monkeypatch)
+
+    listed = {memory_id: (content_hash, status) for memory_id, content_hash, status in store.searchable_hashes()}
+
+    assert parsed == []  # a sync used to parse every file to find what the graph lacks
+    assert set(listed) == {session["summary"]["id"], old["id"], new["id"]}  # no transcript
+    assert listed[old["id"]][1] == "superseded"
+    record = store.record(new["id"])
+    assert listed[new["id"]][0] == content_sha256(str(record.metadata["type"]), record.content)
+
+
 def test_index_follows_files_changed_outside_the_server(tmp_path: Path) -> None:
     store, ids = _store_with(tmp_path, 3)
     edited, removed = store.record(ids[0]), store.record(ids[1])

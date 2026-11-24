@@ -39,6 +39,8 @@ class Timing:
     error: str | None = None
     # Set when the call turned out to do nothing worth timing, so it is not recorded.
     discard: bool = False
+    # For a search: whether its graph facts came from the keyword index alone.
+    keyword_only: bool | None = None
 
     @contextmanager
     def graph(self) -> Iterator[None]:
@@ -58,11 +60,14 @@ class Metrics:
 
     One row per call: total time, the part spent in Graphiti and its OpenAI calls (`graph_ms`),
     the rest (`store_ms`: Markdown, FTS and our own filtering), and how many memories the vault
-    held, so a slowdown can be tied to vault growth. The file is per machine and disposable.
+    held, so a slowdown can be tied to vault growth. A search also notes whether its facts came
+    from the keyword index alone, and every row the service's resident memory (`rss_mb`), so a
+    slowdown can be tied to the process growing. The file is per machine and disposable.
     """
 
     def __init__(self, state_dir: Path) -> None:
         self.db_path = state_dir / "metrics.sqlite3"
+        self._process = _this_process()
         try:
             with connection(self.db_path) as conn:
                 conn.execute(
@@ -75,12 +80,25 @@ class Metrics:
                         graph_ms REAL NOT NULL,
                         memories INTEGER,
                         chars INTEGER,
-                        error TEXT
+                        error TEXT,
+                        keyword_only INTEGER,
+                        rss_mb REAL
                     )
                     """
                 )
+                # Files written before 0.1.5 lack the newer columns, which stay empty on their rows.
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(operations)")}
+                for column, kind in (("keyword_only", "INTEGER"), ("rss_mb", "REAL")):
+                    if column not in columns:
+                        conn.execute(f"ALTER TABLE operations ADD COLUMN {column} {kind}")
         except sqlite3.Error as exc:
             logger.warning("Operation timings will not be recorded: %s", exc)
+
+    def _rss_mb(self) -> float | None:
+        try:
+            return self._process.memory_info().rss / 2**20 if self._process is not None else None
+        except Exception:
+            return None
 
     @contextmanager
     def measure(self, op: str, *, memories: Callable[[], int], chars: int | None = None) -> Iterator[Timing]:
@@ -102,8 +120,8 @@ class Metrics:
         try:
             with connection(self.db_path) as conn:
                 conn.execute(
-                    "INSERT INTO operations(at,op,total_ms,store_ms,graph_ms,memories,chars,error) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO operations(at,op,total_ms,store_ms,graph_ms,memories,chars,error,keyword_only,rss_mb) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         op,
@@ -113,6 +131,8 @@ class Metrics:
                         memories(),
                         chars,
                         timing.error,
+                        None if timing.keyword_only is None else int(timing.keyword_only),
+                        self._rss_mb(),
                     ),
                 )
         except sqlite3.Error as exc:
@@ -158,6 +178,23 @@ class Metrics:
             ],
         )
 
+        searches = [r for r in by_op.get("search_memory", []) if r["keyword_only"] is not None]
+        if searches:
+            keyword_only = sum(r["keyword_only"] for r in searches)
+            lines += [
+                "",
+                f"search_memory: {keyword_only} of {len(searches)} searches ({keyword_only / len(searches):.0%}) "
+                "took their graph facts from the keyword index alone, because the hybrid search missed its budget or failed.",
+            ]
+        rss = [(r["rss_mb"], r["at"]) for r in rows if r["rss_mb"] is not None]
+        if rss:
+            peak, peak_at = max(rss)
+            lines.append(
+                f"Service memory (RSS): median {statistics.median(mb for mb, _ in rss):.0f} MB, "
+                f"max {peak:.0f} MB on {peak_at[:10]}."
+            )
+        lines += _recent_errors(rows)
+
         width = _bucket_width(max(r["memories"] or 0 for r in rows))
         trend = []
         for op in ops:
@@ -184,6 +221,38 @@ class Metrics:
         return "\n".join(lines)
 
 
+def _this_process():
+    # psutil comes with the graph extra. Without it, rows carry no memory figure.
+    try:
+        import psutil
+
+        return psutil.Process()
+    except Exception:
+        return None
+
+
+def _recent_errors(rows: list[sqlite3.Row], days: int = 7, shown: int = 5) -> list[str]:
+    # A graph that fails every call shows up here, rather than only in each tool result.
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    groups: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        if row["error"] and row["at"] >= since:
+            message = " ".join(row["error"].split())
+            groups.setdefault((row["op"], message[:120] + ("…" if len(message) > 120 else "")), []).append(row["at"])
+    if not groups:
+        return []
+    ranked = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
+    table = _table(
+        ["operation", "count", "last", "error"],
+        [[op, str(len(ats)), max(ats)[:16].replace("T", " "), message] for (op, message), ats in ranked[:shown]],
+        text_last=True,
+    )
+    more = len(ranked) - shown
+    return ["", f"Errors in the last {days} days, most frequent first (UTC):", "", *table] + (
+        [f"... and {more} other kinds of error"] if more > 0 else []
+    )
+
+
 def _pct(values: list[float], q: float) -> float:
     ordered = sorted(values)
     return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
@@ -198,9 +267,14 @@ def _bucket_width(max_memories: int) -> int:
     return next((w for w in BUCKET_WIDTHS if max_memories // w < 8), BUCKET_WIDTHS[-1])
 
 
-def _table(header: list[str], rows: list[list[str]]) -> list[str]:
+def _table(header: list[str], rows: list[list[str]], *, text_last: bool = False) -> list[str]:
+    # Numbers align right. The first column, and the last one when it holds text, align left.
     widths = [max(len(cell) for cell in column) for column in zip(header, *rows)]
+    last = len(header) - 1
     return [
-        "  ".join(cell.ljust(w) if i == 0 else cell.rjust(w) for i, (cell, w) in enumerate(zip(row, widths)))
+        "  ".join(
+            cell if text_last and i == last else cell.ljust(w) if i == 0 else cell.rjust(w)
+            for i, (cell, w) in enumerate(zip(row, widths))
+        )
         for row in [header, *rows]
     ]

@@ -157,7 +157,7 @@ The service opens the Markdown store, the FTS5 index and FalkorDB Lite once at s
 A Graphiti ingest takes about 20 seconds of OpenAI calls, against about 40 ms for the Markdown write and FTS. While the service runs, `remember`, `remember_session`, `edit_memory` and `correct_memory` return once the Markdown file and FTS have the memory, with `"graph": {"queued": true, "memory_id": ...}`. One background worker ingests queued memories in write order, one at a time, because Graphiti resolves each episode's entities against the graph built so far. A memory edited again before its turn is ingested once, with its newest text.
 
 - For about 20 seconds after a write, search finds the memory through FTS but not yet through graph facts.
-- At start-up the service queues every memory `sync_memory_graph` would ingest. A memory whose text the graph already has is skipped without calling OpenAI, so this costs a few milliseconds per memory. It picks up memories pulled from git and anything still queued at the last stop.
+- At start-up the service queues every memory `sync_memory_graph` would ingest. It compares the index's content hashes with graph-state's, so it queues only the memories the graph lacks, without reading the vault's files. It picks up memories pulled from git and anything still queued at the last stop.
 - Stopping the service doesn't wait for an ingest in flight. The memory is already in Markdown and FTS, and the next start queues it again.
 - A failed ingest is logged and recorded in graph-state and `metrics`, and the queue moves on. The next start retries it.
 - If Graphiti didn't start, writes ingest right away and return the error, rather than queueing work that would fail where nobody sees it.
@@ -182,7 +182,7 @@ The engine also deletes FalkorDB Lite's `graphiti.db.settings` before opening, s
 
 ### When the graph's redis-server goes away
 
-Before each graph call the service checks that the redis-server it started is still running and its socket is still there. If either is gone, the service logs a warning, with the last line of the server's own log, and opens the graph again the way start-up does. It stops any server left for its graph, starts a new one with a new watcher, and marks memories whose episode the new server lacks as `missing`. Then it queues every memory, as at start-up, so the queue ingests those again, along with any whose ingest failed while the server was gone. A call already running when the server went away returns its error, and the next call works.
+Before each graph call the service checks that the redis-server it started is still running and its socket is still there. If either is gone, the service logs a warning, with the last line of the server's own log, and opens the graph again the way start-up does. It stops any server left for its graph, starts a new one with a new watcher, and marks memories whose episode the new server lacks as `missing`. Then it queues what the graph lacks, as start-up does: those memories, and any whose ingest failed while the server was gone. A call already running when the server went away returns its error, and the next call works.
 
 Up to 0.1.3, every call after that failed until the service restarted. A server that had been stopped gave `Error 2 connecting to <socket>. No such file or directory.`, and one that crashed gave `Error 61 ... Connection refused.` On macOS the watcher caused the first case itself. It identified the service by its start time from psutil, and psutil 7.2 shifts that by a second whenever the boot time crosses a whole second. macOS's clock corrections cause that a few times a day. The watcher then took a running service for a dead one and stopped its server.
 
@@ -202,9 +202,9 @@ The page is read-only and answers only when the `Host` header is localhost, whic
 
 ### Timings
 
-The service writes one row per operation to `metrics.sqlite3`: the operation (the MCP tool name, `graph_ingest` for one background ingest, or `graph_view` for `/graph.json`), the total time, the part spent in Graphiti and its OpenAI calls (`graph_ms`), the rest (`store_ms`), the number of searchable memories at the time, and for writes the content size. An operation that raised, or whose graph step failed and fell back, keeps the error. Recording never fails the operation. A background ingest that skipped an unchanged memory isn't recorded.
+The service writes one row per operation to `metrics.sqlite3`: the operation (the MCP tool name, `graph_ingest` for one background ingest, or `graph_view` for `/graph.json`), the total time, the part spent in Graphiti and its OpenAI calls (`graph_ms`), the rest (`store_ms`), the number of searchable memories at the time, and for writes the content size. A search also records whether its graph facts came from the keyword index alone (`keyword_only`), and every row records the service's resident memory (`rss_mb`). An operation that raised, or whose graph step failed and fell back, keeps the error. Recording never fails the operation. A background ingest that skipped an unchanged memory isn't recorded.
 
-`brain-engine metrics` reports the last 30 days. It gives p50, p90 and max per operation with the store and graph split, then the medians grouped by vault size, so a slowdown that comes with growth shows up as rising rows. Ingests also get Graphiti time per KB, because ingest time grows with the memory's size and only a rise per KB means the graph itself is slowing down.
+`brain-engine metrics` reports the last 30 days. It gives p50, p90 and max per operation with the store and graph split. Then it gives the share of searches that got keyword-only facts, the service's median and peak memory, and the most frequent errors of the last 7 days, so a graph that fails every call shows up in one place. Last come the medians grouped by vault size, so a slowdown that comes with growth shows up as rising rows. Ingests also get Graphiti time per KB, because ingest time grows with the memory's size and only a rise per KB means the graph itself is slowing down.
 
 `scripts/bench_store.py <vault> [sizes...]` answers the same question ahead of time. It copies the vault's Markdown into a temporary folder, pads it with renamed copies of its own memories up to each size, and times search, get, remember, edit and verify with Graphiti stubbed out. It never touches the vault and makes no OpenAI calls.
 
@@ -347,7 +347,7 @@ Each memory records who wrote it (`generated.by`) and, optionally, where it came
 
 Always:
 
-- `search_memory(query, limit=5, kind=None, include_history=false)`. Graph facts come from Graphiti's hybrid search, which needs OpenAI to embed the query. If that takes longer than 0.5 s, the facts come from the graph's keyword index alone, which is local and takes about 40 ms. If Graphiti is down, search returns FTS results and says why in `graph_error`.
+- `search_memory(query, limit=5, kind=None, include_history=false)`. Graph facts come from Graphiti's hybrid search, which needs OpenAI to embed the query. If that takes longer than 1.5 s, or fails, the facts come from the graph's keyword index alone, which is local. The late hybrid search still finishes in the background, so its connection to OpenAI stays open for the next search, and idle connections are kept for 5 minutes. If Graphiti is down, search returns FTS results and says why in `graph_error`.
 - `get_memory(memory_id, offset=0, max_chars=8000)`.
 
 With `MEMORY_ACCESS=read-write`: `remember`, `remember_session`, `edit_memory`, `correct_memory`, `verify_memory`, `sync_memory_graph`. Agents never get file-system write tools.

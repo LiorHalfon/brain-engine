@@ -8,7 +8,7 @@ from brain_engine import service as service_module
 from brain_engine import store as store_module
 from brain_engine.graph import GraphFact
 from brain_engine.service import MemoryService
-from brain_engine.store import MemoryRecord, MemoryStore
+from brain_engine.store import MemoryRecord, MemoryStore, content_sha256
 
 
 class FakeGraph:
@@ -46,6 +46,9 @@ class FakeGraph:
 
     def memory_ids(self) -> set[str]:
         return set(self.records)
+
+    def ingested_hashes(self) -> dict[str, str]:
+        return {}  # its ingest never skips a memory, so it reports none as already in the graph
 
     async def snapshot(self) -> dict:
         if self.fail_search:
@@ -428,23 +431,69 @@ def test_start_queues_the_memories_sync_would_ingest(tmp_path: Path) -> None:
     assert graph.ingested == [new["id"]]
 
 
-def test_a_graph_that_opens_again_gets_every_memory_queued(tmp_path: Path) -> None:
+class HashedGraph(FakeGraph):
+    """Remembers the text it ingested, as graph-state does, so the service can skip what it has."""
+
+    def ingested_hashes(self) -> dict[str, str]:
+        return {
+            memory_id: content_sha256(str(record.metadata.get("type") or "note"), record.content)
+            for memory_id, record in self.records.items()
+        }
+
+
+def test_a_graph_that_opens_again_gets_what_it_lacks_queued(tmp_path: Path) -> None:
     # Its new redis-server lacks what the old one had not saved, and ingests that failed meanwhile.
     store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
-    memory = store.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note")
-    graph = FakeGraph()
+    lost = store.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note")
+    kept = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    graph = HashedGraph()
     service = MemoryService(store, graph)
 
     async def scenario() -> None:
         await service.start(ingest_in_background=True)
         await asyncio.wait_for(service.graph_idle(), 1)
+        del graph.records[lost["id"]]  # its episode was never saved
         graph.on_reopen()
         await asyncio.wait_for(service.graph_idle(), 1)
         await service.close()
 
     run(scenario())
-    assert graph.ingested == [memory["id"], memory["id"]]
+    assert sorted(graph.ingested[:2]) == sorted([lost["id"], kept["id"]])
+    assert graph.ingested[2:] == [lost["id"]]
     assert graph.on_reopen is None
+
+
+def test_sync_ingests_what_the_graph_lacks_without_parsing_the_vault(tmp_path: Path, monkeypatch) -> None:
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    ids = [store.remember(title=f"Fact {i}", content=f"Fact number {i}.", kind="note")["id"] for i in range(3)]
+    graph = HashedGraph()
+    service = MemoryService(store, graph)
+    assert run(service.sync_graph()) == {"indexed": 3, "removed": 0, "skipped": 0, "errors": []}
+    store.edit(ids[1], "Fact number one, edited.")
+    parsed: list[Path] = []
+    real_parse = store_module.parse_markdown
+    monkeypatch.setattr(store_module, "parse_markdown", lambda path: parsed.append(path) or real_parse(path))
+
+    assert run(service.sync_graph()) == {"indexed": 1, "removed": 0, "skipped": 2, "errors": []}
+
+    assert graph.ingested[-1] == ids[1]
+    assert len(parsed) == 1  # only the edited memory, read to ingest it
+
+
+def test_start_queues_nothing_the_graph_already_has(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory", actor="test/1", human_id="owner")
+    store.remember(title="Opening hours", content="The Springfield office opens at 9.", kind="note")
+    graph = HashedGraph()
+    service = MemoryService(store, graph)
+    run(service.sync_graph())
+
+    async def scenario() -> None:
+        await service.start(ingest_in_background=True)
+        assert service._ingest_queue.qsize() == 0
+        await service.close()
+
+    run(scenario())
+    assert len(graph.ingested) == 1
 
 
 def test_close_does_not_wait_for_a_running_ingest(tmp_path: Path) -> None:

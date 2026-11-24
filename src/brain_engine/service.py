@@ -77,10 +77,22 @@ class MemoryService:
 
     def _catch_up(self) -> None:
         # Catch up on what the graph missed: memories pulled from git, or still queued at the last
-        # stop. Ingest skips a memory whose text the graph already has, without calling OpenAI.
-        for record in self.store.iter_records(searchable_only=True):
-            if record.metadata.get("status") != "superseded":  # the same memories sync_graph ingests
-                self._queue_ingest(record.id)
+        # stop. These are the memories sync_graph would ingest.
+        for memory_id in self._not_in_graph():
+            self._queue_ingest(memory_id)
+
+    def _not_in_graph(self, searchable: list[tuple[str, str, str]] | None = None) -> list[str]:
+        """The searchable, current memories whose text the graph doesn't have, in path order.
+
+        Read from the index and graph-state, without parsing the vault. Ingest checks again from
+        the file, so a memory edited since the index last looked is still ingested once.
+        """
+        ingested = self.graph.ingested_hashes()
+        return [
+            memory_id
+            for memory_id, content_hash, status in (self.store.searchable_hashes() if searchable is None else searchable)
+            if status != "superseded" and ingested.get(memory_id) != content_hash
+        ]
 
     async def close(self) -> None:
         self.graph.on_reopen = None
@@ -168,6 +180,8 @@ class MemoryService:
                         limit=limit * 2,
                         include_invalidated=include_history,
                     )
+                if self.graph.enabled:
+                    timing.keyword_only = bool(getattr(raw_graph_results, "keyword_only", False))
                 graph_results = []
                 seen_facts: set[str] = set()
                 for fact in raw_graph_results:
@@ -309,12 +323,16 @@ class MemoryService:
                             removed += 1
                 except Exception as exc:
                     errors.append({"memory_id": memory_id, "error": str(exc)})
-            for record in self.store.iter_records(searchable_only=True):
-                if record.metadata.get("status") == "superseded":
-                    # Keep historical episodes already in the graph, but don't newly ingest a source
-                    # already marked superseded before Graphiti was enabled.
-                    skipped += 1
-                    continue
+            # Superseded memories keep the historical episodes already in the graph, but a source
+            # already marked superseded before Graphiti was enabled is not newly ingested.
+            searchable = self.store.searchable_hashes()
+            missing = self._not_in_graph(searchable)
+            skipped += len(searchable) - len(missing)
+            for memory_id in missing:
+                try:
+                    record = self.store.record(memory_id)
+                except KeyError:
+                    continue  # deleted since the index listed it
                 try:
                     with timing.graph():
                         result = await self.graph.ingest(record)
