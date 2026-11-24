@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+
+- On macOS the graph's watcher no longer stops the redis-server of a service that is still running. It identified the service by its start time from psutil. psutil 7.2 shifts `create_time()` by a second whenever the system boot time crosses a whole second, and macOS's clock corrections cause that a few times a day. The watcher then took the service for dead and sent its server `SHUTDOWN SAVE`. Every graph call after that failed with `Error 2 connecting to <socket>. No such file or directory.` until the service restarted. The watcher now waits on a pipe whose write end the service holds open. The kernel closes that end however the service exits, so neither clock changes nor reused pids matter.
+- When the watcher stops a server, or fails to, it says so in `watchdog.log` in the state folder. When the service's stderr is a file, as a launchd agent's log is, the same line goes there too.
+- A service whose graph server is gone opens the graph again on the next graph call, instead of failing every call until a restart. That covers a server that was stopped and one that crashed: a FalkorDB Lite redis-server can segfault, and the socket it leaves behind refuses connections. The service logs "Opening the graph again on a new one" with the last line of the server's log. It stops any server left for the graph and starts a new one. Then it queues every memory, so the ingests that failed meanwhile and the episodes the old server never saved go in again.
+- A service started on an older tag keeps its old watcher until it restarts. No migration: the state format is unchanged.
+
 ## 0.1.3
 
 - Every SQLite connection is closed as soon as its transaction ends. `with sqlite3.connect(path)` only commits, so each one kept its file descriptor until Python's cyclic garbage collector ran, and a sync opens one per memory. On a vault of about 400 memories a service spiked to about 250 open files on every sync and held up to 200 while idle. Under launchd's default limit of 256 that failed with `Too many open files`, or `unable to open database file`. The same load now peaks at about 55. No migration: the state format is unchanged.

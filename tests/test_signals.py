@@ -127,6 +127,10 @@ def test_a_killed_service_tree_still_saves_and_stops_its_graph(service) -> None:
     _wait_until(lambda: not psutil.pid_exists(redis.pid), 10, "redis-server outlived the killed service")
     assert find_servers(graph_db) == []
     assert graph_db.stat().st_mtime > before, "graphiti.db was not saved"
+    # The service's stderr is a file, as a launchd agent's is, so the watcher's note lands beside its log.
+    note = f"(pid {process.pid}) is gone, so it saved and stopped the graph's redis-server"
+    _wait_until(lambda: note in log.read_text(), 5, "the watcher wrote nothing to the service's log")
+    assert note in (graph_db.parent / "watchdog.log").read_text()
 
 
 def _start_stdio(vault: Path, log: Path) -> subprocess.Popen:

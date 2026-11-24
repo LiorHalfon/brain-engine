@@ -171,7 +171,7 @@ Ctrl-C, `kill <pid>` (SIGTERM) and closing the terminal that runs the service (S
 - Each connected client holds a `subscriptions/listen` request open. The service ends those streams first, which is the spec's graceful close, and clients listen again when the service is back. uvicorn's 3-second timeout then only cuts off a tool call still running.
 - FalkorDB Lite runs a `redis-server` process that writes `graphiti.db` only on a timer. Closing the graph sends it `SHUTDOWN SAVE`, so the file is current and the process exits.
 - A signal that arrives while the service is still opening the graph cancels the start and closes what was opened.
-- Some terminals don't send a signal the service can catch. Closing a tab in the Claude desktop app's terminal panel SIGKILLs the service and every process it started. FalkorDB Lite's redis-server is detached from the service, so it survives that. When the graph opens, the engine starts a small watcher, detached the same way, that checks on the service twice a second. Once the service is gone the watcher sends the redis-server `SHUTDOWN SAVE`, so `graphiti.db` is saved and nothing is left running about a second later. When the service stops the server itself, the watcher just exits.
+- Some terminals don't send a signal the service can catch. Closing a tab in the Claude desktop app's terminal panel SIGKILLs the service and every process it started. FalkorDB Lite's redis-server is detached from the service, so it survives that. When the graph opens, the engine starts a small watcher, detached the same way, that waits on a pipe the service holds open. However the service ends, the kernel closes its end of the pipe. The watcher then sends the redis-server `SHUTDOWN SAVE`, so `graphiti.db` is saved and nothing is left running a moment later. When the service stops the server itself, the watcher just exits. Each server the watcher stops, or fails to stop, gets a line in `watchdog.log` in the state folder. When the service's stderr is a file, as a launchd agent's log is, the line goes there too.
 
 Older servers stopped cleanly only on Ctrl-C. After a `kill` or a closed terminal their redis-server kept running, and whatever killed it later, a logout for example, made it write its in-memory graph over `graphiti.db`. That graph could be older than the one on disk. Two things clean up after them:
 
@@ -179,6 +179,12 @@ Older servers stopped cleanly only on Ctrl-C. After a `kill` or a closed termina
 - Opening the graph checks graph-state against the episodes actually in the graph. A memory marked ingested whose episode is gone is marked `missing`, and the start-up catch-up and `sync-graph` ingest it again. The log counts them.
 
 The engine also deletes FalkorDB Lite's `graphiti.db.settings` before opening, so it never reattaches to a server it didn't start. In a copied state folder that file names the original vault's server.
+
+### When the graph's redis-server goes away
+
+Before each graph call the service checks that the redis-server it started is still running and its socket is still there. If either is gone, the service logs a warning, with the last line of the server's own log, and opens the graph again the way start-up does. It stops any server left for its graph, starts a new one with a new watcher, and marks memories whose episode the new server lacks as `missing`. Then it queues every memory, as at start-up, so the queue ingests those again, along with any whose ingest failed while the server was gone. A call already running when the server went away returns its error, and the next call works.
+
+Up to 0.1.3, every call after that failed until the service restarted. A server that had been stopped gave `Error 2 connecting to <socket>. No such file or directory.`, and one that crashed gave `Error 61 ... Connection refused.` On macOS the watcher caused the first case itself. It identified the service by its start time from psutil, and psutil 7.2 shifts that by a second whenever the boot time crosses a whole second. macOS's clock corrections cause that a few times a day. The watcher then took a running service for a dead one and stopped its server.
 
 ### Graph viewer
 

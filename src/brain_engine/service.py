@@ -70,6 +70,12 @@ class MemoryService:
             return
         self._ingest_queue = asyncio.Queue()
         self._ingest_worker = asyncio.create_task(self._ingest_queued())
+        # A graph that reopens on a new redis-server lacks what its old one had not saved, and
+        # ingests that failed while it was gone.
+        self.graph.on_reopen = self._catch_up
+        self._catch_up()
+
+    def _catch_up(self) -> None:
         # Catch up on what the graph missed: memories pulled from git, or still queued at the last
         # stop. Ingest skips a memory whose text the graph already has, without calling OpenAI.
         for record in self.store.iter_records(searchable_only=True):
@@ -77,6 +83,7 @@ class MemoryService:
                 self._queue_ingest(record.id)
 
     async def close(self) -> None:
+        self.graph.on_reopen = None
         if self._ingest_worker is not None:
             # Don't wait for an ingest in flight: the next start queues it again.
             self._ingest_worker.cancel()

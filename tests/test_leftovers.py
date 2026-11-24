@@ -149,14 +149,6 @@ async def test_a_copied_registry_never_attaches_to_another_vaults_server(
     assert find_servers(original / "graphiti.db")[0].unsaved_changes == 1
 
 
-def test_a_reused_pid_is_not_the_owner() -> None:
-    from brain_engine.watchdog import _owner_alive
-
-    me = psutil.Process()
-    assert _owner_alive(me.pid, me.create_time())
-    assert not _owner_alive(me.pid, me.create_time() - 60)  # same pid, started earlier: someone else's
-
-
 def test_a_path_in_another_case_still_finds_the_server(tmp_path: Path, leave_server) -> None:
     folder = tmp_path / "CaseVault"
     folder.mkdir()
