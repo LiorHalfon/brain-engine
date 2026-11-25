@@ -5,6 +5,7 @@ import contextlib
 import logging
 import os
 import sqlite3
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from brain_engine.config import DEFAULT_GRAPH_MODEL
+from brain_engine.config import DEFAULT_GRAPH_MODEL, Embedding
 from brain_engine.db import connection
 from brain_engine.leftovers import stop_leftover_servers
 from brain_engine.watchdog import LOG_NAME, Watchdog, start_watchdog
@@ -51,6 +52,18 @@ LATE_SEARCH_SECONDS = 30
 OPENAI_KEEPALIVE_SECONDS = 300
 # Saving a graph takes well under a second; past this, closing gives up rather than hang the exit.
 CLOSE_TIMEOUT_SECONDS = 60
+# Re-embedding sends the model this many names or facts per request, and waits this long to try
+# again after a failure, such as an embedding server that isn't up yet.
+REEMBED_BATCH = 64
+REEMBED_RETRY_SECONDS = 60
+# graph-state's record of the model that made the graph's vectors, while a re-embed is unfinished.
+MIXED_VECTORS = "mixed"
+# What Graphiti embeds: the pattern that finds it as `x`, the property it embeds, and the vector's.
+VECTORS = [
+    ("entity names", "(x:Entity)", "name", "name_embedding"),
+    ("facts", "()-[x:RELATES_TO]->()", "fact", "fact_embedding"),
+    ("community names", "(x:Community)", "name", "name_embedding"),
+]
 
 
 @dataclass
@@ -135,12 +148,14 @@ class GraphitiBackend:
         name: str = "brain-engine",
         model: str = DEFAULT_GRAPH_MODEL,
         small_model: str = DEFAULT_GRAPH_MODEL,
+        embedding: Embedding = Embedding(),
     ) -> None:
         self.state_dir = state_dir
         # Episodes record their source as `<name>:<path>`.
         self.name = name
         self.model = model
         self.small_model = small_model
+        self.embedding = embedding
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.graph_db_path = self.state_dir / "graphiti.db"
         self.state_db_path = self.state_dir / "graph-state.sqlite3"
@@ -154,9 +169,15 @@ class GraphitiBackend:
         self._watchdog: Watchdog | None = None
         # Set when the server went away, until the graph is open again on a new one.
         self._reopening = False
-        # Graphiti's OpenAI client, kept across reopens, and searches left to finish in the background.
+        # Graphiti's OpenAI client and, for a model on another server, the embedding client, both
+        # kept across reopens. Searches left to finish in the background.
         self._openai: Any = None
+        self._embedding_server: Any = None
         self._unawaited: set[asyncio.Future[Any]] = set()
+        # True while the graph holds vectors another embedding model made, until the re-embed
+        # running in `_reembedding` replaces them.
+        self._vectors_stale = False
+        self._reembedding: asyncio.Task[None] | None = None
         # Concurrent requests must not each open their own FalkorDB Lite instance.
         self._client_lock = asyncio.Lock()
         # One writer at a time. Graphiti reads the nodes and edges an episode touches, spends seconds
@@ -182,6 +203,19 @@ class GraphitiBackend:
                     indexed_at TEXT
                 )
                 """
+            )
+            conn.execute("CREATE TABLE IF NOT EXISTS graph_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+    def _meta(self, key: str) -> str | None:
+        with self._connect_state() as conn:
+            row = conn.execute("SELECT value FROM graph_meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def _set_meta(self, key: str, value: str) -> None:
+        with self._connect_state() as conn:
+            conn.execute(
+                "INSERT INTO graph_meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
             )
 
     async def start(self) -> None:
@@ -249,7 +283,7 @@ class GraphitiBackend:
         try:
             from graphiti_core import Graphiti
             from graphiti_core.driver.falkordb_driver import FalkorDriver
-            from graphiti_core.embedder import OpenAIEmbedder
+            from graphiti_core.embedder import OpenAIEmbedder, OpenAIEmbedderConfig
             from redislite.async_falkordb_client import AsyncFalkorDB
         except ImportError as exc:  # pragma: no cover - depends on optional runtime dependency
             raise RuntimeError(
@@ -274,10 +308,110 @@ class GraphitiBackend:
         driver = FalkorDriver(falkor_db=falkor)
         if self._openai is None:
             self._openai = self._openai_client()
-        client = Graphiti(graph_driver=driver, llm_client=self._llm_client(self._openai), embedder=OpenAIEmbedder(client=self._openai))
+        embedder = OpenAIEmbedder(
+            config=OpenAIEmbedderConfig(embedding_model=self.embedding.model, embedding_dim=self.embedding.dimensions),
+            client=self._embedding_client(),
+        )
+        client = Graphiti(graph_driver=driver, llm_client=self._llm_client(self._openai), embedder=embedder)
         await client.build_indices_and_constraints()
         await self._forget_missing_episodes(client)
+        await self._check_vectors(client)
         return client
+
+    def _embedding_client(self) -> Any:
+        if self.embedding.base_url is None:
+            return self._openai  # OpenAI's model shares the LLM's connections
+        if self._embedding_server is None:
+            key_env = self.embedding.api_key_env
+            if key_env and not os.environ.get(key_env):
+                raise RuntimeError(f"{key_env}, which brain.toml's embedding_api_key_env names, is not set")
+            self._embedding_server = self._openai_client(
+                base_url=self.embedding.base_url,
+                # The OpenAI client refuses to start without a key, and a local server takes any.
+                api_key=os.environ[key_env] if key_env else "unused",
+            )
+        return self._embedding_server
+
+    async def _check_vectors(self, client: Any) -> None:
+        """Re-embed the graph in the background if another embedding model made its vectors.
+
+        A query vector compares only with vectors from the same model, so until the re-embed is
+        done search answers from the graph's keyword index, and writes wait for it.
+        """
+        wanted = self.embedding.identity
+        made_by = self._meta("embedding")
+        counts = {}
+        for what, pattern, _, vector in VECTORS:
+            records, _, _ = await client.driver.execute_query(
+                f"MATCH {pattern} WHERE x.{vector} IS NOT NULL RETURN count(x) AS count"
+            )
+            counts[what] = int(records[0]["count"])
+        if made_by is None:
+            # Graphs from before 0.1.6 don't say. The only model they could use was Graphiti's
+            # default, and an empty graph has no vectors yet.
+            made_by = Embedding().identity if sum(counts.values()) else wanted
+            self._set_meta("embedding", made_by)
+        self._vectors_stale = made_by != wanted
+        if not self._vectors_stale:
+            return
+        logger.warning(
+            "%s Re-embedding %s with %s in the background. Until it's done, search takes its graph facts "
+            "from the keyword index and writes to the graph wait.",
+            "A re-embed of the graph's vectors did not finish."
+            if made_by == MIXED_VECTORS
+            else f"The graph's vectors were made by {made_by}.",
+            ", ".join(f"{count} {what}" for what, count in counts.items()),
+            wanted,
+        )
+        running = self._reembedding
+        if running is not None and running is asyncio.current_task():
+            return  # this re-embed goes on, on the new server
+        if running is not None:
+            running.cancel()  # its server is gone
+        self._reembedding = asyncio.create_task(self._reembed_in_background())
+
+    async def _reembed_in_background(self) -> None:
+        while self._vectors_stale:
+            try:
+                async with self._write_lock:
+                    await self._reembed_if_stale(await self._get_client())
+            except Exception as exc:
+                logger.warning("Re-embedding the graph failed, trying again in %ss: %s", REEMBED_RETRY_SECONDS, exc)
+                await asyncio.sleep(REEMBED_RETRY_SECONDS)
+
+    async def _reembed_if_stale(self, client: Any) -> None:
+        # The caller holds `_write_lock`.
+        if self._vectors_stale:
+            await self._reembed(client)
+            self._vectors_stale = False
+
+    async def _reembed(self, client: Any) -> None:
+        """Have the configured model make every vector in the graph again."""
+        start = time.monotonic()
+        # Set first, so a re-embed that stops halfway is done again in full.
+        self._set_meta("embedding", MIXED_VECTORS)
+        done = []
+        for what, pattern, embedded, vector in VECTORS:
+            found = f"MATCH {pattern} WHERE x.{vector} IS NOT NULL"
+            # Graphiti doesn't embed a blank name or fact, and an embedding API may refuse one.
+            await client.driver.execute_query(f"{found} AND trim(coalesce(x.{embedded}, '')) = '' SET x.{vector} = NULL")
+            records, _, _ = await client.driver.execute_query(f"{found} RETURN x.uuid AS uuid, x.{embedded} AS text")
+            # Graphiti embeds a name or a fact with its newlines turned into spaces.
+            rows = [(str(record["uuid"]), str(record["text"]).replace("\n", " ")) for record in records]
+            for at in range(0, len(rows), REEMBED_BATCH):
+                batch = rows[at : at + REEMBED_BATCH]
+                vectors = await client.embedder.create_batch([text for _, text in batch])
+                await client.driver.execute_query(
+                    f"UNWIND $rows AS row MATCH {pattern} WHERE x.uuid = row.uuid SET x.{vector} = vecf32(row.vector)",
+                    rows=[{"uuid": uuid, "vector": values} for (uuid, _), values in zip(batch, vectors, strict=True)],
+                )
+            done.append(f"{len(rows)} {what}")
+        if self._falkor is not None:
+            # The redis-server saves on a timer. Saved now, a crash can't bring back old vectors
+            # under a record that says they are new.
+            await self._falkor.connection.execute_command("SAVE")
+        self._set_meta("embedding", self.embedding.identity)
+        logger.warning("Re-embedded %s with %s in %.0f s.", ", ".join(done), self.embedding.identity, time.monotonic() - start)
 
     @staticmethod
     def _server_process(pid: int | None) -> Any:
@@ -321,8 +455,8 @@ class GraphitiBackend:
         return OpenAIClient(config=LLMConfig(model=self.model, small_model=self.small_model), client=openai)
 
     @staticmethod
-    def _openai_client() -> Any:
-        """The OpenAI client for Graphiti's LLM and embedding calls, which keeps idle connections open."""
+    def _openai_client(**options: Any) -> Any:
+        """An OpenAI client for Graphiti's LLM and embedding calls, which keeps idle connections open."""
         import openai
 
         try:
@@ -330,7 +464,7 @@ class GraphitiBackend:
         except ImportError:
             import httpx as http
         limits = http.Limits(max_connections=1000, max_keepalive_connections=100, keepalive_expiry=OPENAI_KEEPALIVE_SECONDS)
-        return openai.AsyncOpenAI(http_client=openai.DefaultAsyncHttpxClient(limits=limits))
+        return openai.AsyncOpenAI(http_client=openai.DefaultAsyncHttpxClient(limits=limits), **options)
 
     @staticmethod
     def _reference_time(record: MemoryRecord) -> datetime:
@@ -395,6 +529,8 @@ class GraphitiBackend:
             }
 
         client = await self._get_client()
+        # Graphiti compares a new episode's names and facts with the graph's by their vectors.
+        await self._reembed_if_stale(client)
         if previous and previous["episode_uuid"]:
             # An in-place Markdown edit is a source correction. Replace the episode rather than
             # asking Graphiti to treat both source versions as distinct life events.
@@ -497,7 +633,10 @@ class GraphitiBackend:
     async def _search_edges(self, client: Any, query: str) -> tuple[list[Any], bool]:
         """Graphiti's hybrid search when it answers within the budget, else the keyword index's
         edges. The second value says which."""
-        hybrid = asyncio.ensure_future(asyncio.wait_for(client.search(query), LATE_SEARCH_SECONDS))
+        if self._vectors_stale:
+            # The graph holds vectors from two models until the re-embed is done.
+            return await self._keyword_search(client, query), True
+        hybrid = asyncio.ensure_future(asyncio.wait_for(self._hybrid_search(client, query), LATE_SEARCH_SECONDS))
         try:
             done, _ = await asyncio.wait({hybrid}, timeout=SEARCH_BUDGET_SECONDS)
         except asyncio.CancelledError:
@@ -511,6 +650,18 @@ class GraphitiBackend:
             # Usually OpenAI. The keyword index needs only the graph, which answers or fails here too.
             logger.info("Graphiti's hybrid search failed, so search answers from the keyword index: %s", hybrid.exception())
         return await self._keyword_search(client, query), True
+
+    async def _hybrid_search(self, client: Any, query: str) -> list[Any]:
+        from graphiti_core.search.search_config import DEFAULT_SEARCH_LIMIT
+        from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
+
+        if not query.strip():
+            return []
+        # Graphiti's own `search`, which embeds the query as it stands. Some models, Qwen3-Embedding
+        # among them, need an instruction in front of a query to find what answers it.
+        vector = await client.embedder.create(input_data=[self.embedding.query_instruction + query.replace("\n", " ")])
+        config = EDGE_HYBRID_SEARCH_RRF.model_copy(update={"limit": DEFAULT_SEARCH_LIMIT})
+        return (await client.search_(query, config=config, query_vector=vector)).edges
 
     def _let_finish(self, task: asyncio.Future[Any]) -> None:
         # Keep a reference so the task runs to the end, and take its error so none is reported unread.
@@ -610,9 +761,12 @@ class GraphitiBackend:
         }
 
     async def close(self) -> None:
-        for task in list(self._unawaited):
+        # A re-embed cut short is done again in full by the next start.
+        pending = [*self._unawaited, *([self._reembedding] if self._reembedding is not None else [])]
+        for task in pending:
             task.cancel()
-        await asyncio.gather(*self._unawaited, return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._reembedding = None
         if self._falkor is not None:
             if not self._server_gone():
                 try:
@@ -627,9 +781,10 @@ class GraphitiBackend:
         if self._client is not None:
             await self._client.close()
             self._client = None
-        if self._openai is not None:
-            await self._openai.close()
-            self._openai = None
+        for name in ("_openai", "_embedding_server"):
+            if getattr(self, name) is not None:
+                await getattr(self, name).close()
+                setattr(self, name, None)
 
     @staticmethod
     async def _stop_redis(socket_file: str) -> None:

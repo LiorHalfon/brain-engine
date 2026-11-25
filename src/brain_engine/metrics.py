@@ -58,7 +58,7 @@ class Timing:
 class Metrics:
     """How long each service operation takes, kept in `metrics.sqlite3` in the state dir.
 
-    One row per call: total time, the part spent in Graphiti and its OpenAI calls (`graph_ms`),
+    One row per call: total time, the part spent in Graphiti and its model calls (`graph_ms`),
     the rest (`store_ms`: Markdown, FTS and our own filtering), and how many memories the vault
     held, so a slowdown can be tied to vault growth. A search also notes whether its facts came
     from the keyword index alone, and every row the service's resident memory (`rss_mb`), so a
@@ -158,7 +158,7 @@ class Metrics:
         lines = [
             f"Memory operation timings on this machine, {rows[0]['at'][:10]} to {rows[-1]['at'][:10]} "
             f"({len(rows)} calls, last {days} days)",
-            "store = our Markdown/FTS code, graph = Graphiti and its OpenAI calls",
+            "store = our Markdown/FTS code, graph = Graphiti and its model calls",
             "",
         ]
         lines += _table(

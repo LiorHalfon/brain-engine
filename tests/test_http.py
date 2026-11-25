@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import httpx2
@@ -148,8 +149,13 @@ async def test_multiple_clients_share_one_service(tmp_path: Path) -> None:
 
 
 class _FakeGraphitiClient:
-    async def search(self, query: str) -> list:
-        return []
+    class embedder:
+        @staticmethod
+        async def create(input_data: list[str]) -> list[float]:
+            return [1.0]
+
+    async def search_(self, query: str, config, query_vector: list[float] | None = None) -> SimpleNamespace:
+        return SimpleNamespace(edges=[])
 
     async def close(self) -> None:
         return None

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from brain_engine.config import DEFAULT_GRAPH_MODEL, DEFAULT_KINDS, ConfigError, Settings, find_vault
+from brain_engine.config import DEFAULT_GRAPH_MODEL, DEFAULT_KINDS, ConfigError, Embedding, Settings, find_vault
 from brain_engine.lock import GraphOwnedElsewhere, hold_state_lock
 from brain_engine.store import MemoryStore
 from conftest import make_vault
@@ -25,7 +25,33 @@ def test_defaults(tmp_path: Path) -> None:
     assert settings.actor == "test-vault/local"
     assert settings.human_id == "owner" and settings.access == "read-write" and settings.graph_enabled
     assert settings.graph_model == settings.graph_small_model == DEFAULT_GRAPH_MODEL == "gpt-6-luna"
+    # Graphiti's default embedder, which made the vectors of every graph before 0.1.6.
+    assert settings.embedding == Embedding("text-embedding-3-small", None, 1024, "", None)
     assert settings.url == "http://127.0.0.1:8766/mcp"
+
+
+def test_a_local_embedding_model(tmp_path: Path) -> None:
+    vault = make_vault(
+        tmp_path / "vault",
+        embedding_model="local-embedder",
+        embedding_base_url="http://127.0.0.1:11434/v1",
+        embedding_dimensions=768,
+        embedding_query_instruction="Instruct: find the facts that answer the query\nQuery: ",
+        embedding_api_key_env="EMBEDDING_KEY",
+    )
+
+    embedding = Settings.load(vault, environ={}).embedding
+
+    assert embedding == Embedding(
+        model="local-embedder",
+        base_url="http://127.0.0.1:11434/v1",
+        dimensions=768,
+        query_instruction="Instruct: find the facts that answer the query\nQuery: ",
+        api_key_env="EMBEDDING_KEY",
+    )
+    # The server and the query instruction don't change the stored vectors.
+    assert embedding.identity == "local-embedder, 768 dimensions"
+    assert Settings.load(make_vault(tmp_path / "blank", embedding_base_url=" "), environ={}).embedding.base_url is None
 
 
 def test_toml_values_and_engine_kinds_added(tmp_path: Path) -> None:
@@ -110,6 +136,13 @@ def test_missing_brain_toml(tmp_path: Path) -> None:
         ({"port": "eighty"}, "port"),
         ({"port": 8766.9}, "port"),
         ({"kinds": {"Decision": "decisions"}}, "Decision"),
+        ({"embedding_base_url": "127.0.0.1:11434/v1"}, "embedding_base_url"),
+        ({"embedding_dimensions": 0}, "embedding_dimensions"),
+        ({"embedding_dimensions": "1024"}, "embedding_dimensions"),
+        ({"embedding_dimensions": True}, "embedding_dimensions"),
+        ({"embedding_model": ""}, "embedding_model"),
+        ({"embedding_query_instruction": 3}, "embedding_query_instruction"),
+        ({"embedding_api_key_env": ""}, "embedding_api_key_env"),
     ],
 )
 def test_bad_brain_toml_is_named(tmp_path: Path, fields: dict, message: str) -> None:

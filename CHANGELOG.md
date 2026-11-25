@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6
+
+- The graph's embedding model is set in `brain.toml`: `embedding_model`, `embedding_base_url` for any OpenAI-compatible server such as Ollama, `embedding_dimensions`, `embedding_query_instruction` and `embedding_api_key_env`. The default stays OpenAI's `text-embedding-3-small` at 1024 dimensions, so a vault that sets none of them keeps its vectors. The README's "A local embedding model" sets up Qwen3-Embedding-0.6B through Ollama. On two vaults' graphs it cut the median search from 266 and 255 ms to 32 and 65 ms, and found the facts behind a memory as often as OpenAI's model.
+- Search embeds the query itself, with the query instruction in front, and hands the vector to Graphiti's hybrid search with the config Graphiti's own `search` uses. With no instruction the query and its results are the same as before.
+- graph-state records which model made the graph's vectors, in a new `graph_meta` table. Migration: a graph from before 0.1.6 is recorded as `text-embedding-3-small` at 1024 dimensions when it first opens, since that is the only model older engines used. It re-embeds and ingests nothing.
+- When `brain.toml` names another model, opening the graph re-embeds every entity name, fact and community name in the background. It makes no LLM calls and ingests nothing again. Until it's done, search takes its graph facts from the keyword index and writes to the graph wait. If a re-embed stops halfway, the next open does it again in full, and one that fails tries again every minute. The redis-server saves before graph-state records the new model, so a crash can't leave old vectors under it.
+- Engines before 0.1.6 refuse `brain.toml` files with the new fields, so a vault on a local model can't run on an older tag by mistake, which would compare OpenAI query vectors with local ones.
+
 ## 0.1.5
 
 - Search gets graph facts from Graphiti's hybrid search far more often. On two vaults' metrics, half of all searches, and nearly every first search after a pause of 5 minutes or more, missed the 0.5 s budget and answered from the keyword index alone. Three things caused it. httpx closed an idle connection to OpenAI after 5 s, so most searches paid for a new TLS handshake. The budget left no room for that handshake. And cancelling a late search closed the connection it had just opened. Now idle OpenAI connections stay open for 5 minutes, and Graphiti's LLM and embedder share them. The budget is 1.5 s, and a search past it still finishes in the background. A hybrid search that fails, usually on OpenAI, also falls back to the keyword index instead of returning no facts.
