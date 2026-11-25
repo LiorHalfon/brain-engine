@@ -49,6 +49,7 @@ class MemoryService:
             name=settings.name,
             model=settings.graph_model,
             small_model=settings.graph_small_model,
+            embedding=settings.embedding,
         )
         return cls(store, graph)
 

@@ -9,11 +9,46 @@ from types import SimpleNamespace
 
 import pytest
 
-from brain_engine.graph import GraphitiBackend
+from brain_engine.config import Embedding
+from brain_engine.db import connection
+from brain_engine.graph import MIXED_VECTORS, GraphitiBackend
 from brain_engine.service import MemoryService
 from brain_engine.store import MemoryStore, content_sha256
 
 errors = pytest.importorskip("graphiti_core.errors")
+EmbedderClient = pytest.importorskip("graphiti_core.embedder.client").EmbedderClient
+
+
+class FakeEmbedder(EmbedderClient):
+    """Graphiti's embedder: it notes each text it embeds, and can be slow or fail."""
+
+    def __init__(self, seconds: float = 0, error: Exception | None = None) -> None:
+        self.seconds = seconds
+        self.error = error
+        self.texts: list[str] = []
+        self.cancelled = 0
+
+    @staticmethod
+    def vector(text: str) -> list[float]:
+        return [float(len(text)), 1.0]
+
+    async def create(self, input_data: list[str]) -> list[float]:
+        try:
+            await asyncio.sleep(self.seconds)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        if self.error is not None:
+            raise self.error
+        self.texts += input_data
+        return self.vector(input_data[0])
+
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        await asyncio.sleep(self.seconds)
+        if self.error is not None:
+            raise self.error
+        self.texts += input_data_list
+        return [self.vector(text) for text in input_data_list]
 
 
 class FakeGraphiti:
@@ -23,6 +58,7 @@ class FakeGraphiti:
     fact, so search finds a fact only while its episode is in the graph."""
 
     def __init__(self) -> None:
+        self.embedder = FakeEmbedder()
         self.episodes: dict[str, str] = {}
         self.sources: list[str] = []
         self.added = 0
@@ -52,14 +88,16 @@ class FakeGraphiti:
         self.episodes[episode_uuid] = episode_body
         return SimpleNamespace(episode=SimpleNamespace(uuid=episode_uuid), edges=[])
 
-    async def search(self, query: str) -> list:
+    async def search_(self, query: str, config, query_vector: list[float] | None = None) -> SimpleNamespace:
         await asyncio.sleep(0)
         terms = query.casefold().split()
-        return [
-            SimpleNamespace(uuid=f"fact-{uuid}", fact=body.strip(), valid_at=None, invalid_at=None, episodes=[uuid])
-            for uuid, body in self.episodes.items()
-            if any(term in body.casefold() for term in terms)
-        ]
+        return SimpleNamespace(
+            edges=[
+                SimpleNamespace(uuid=f"fact-{uuid}", fact=body.strip(), valid_at=None, invalid_at=None, episodes=[uuid])
+                for uuid, body in self.episodes.items()
+                if any(term in body.casefold() for term in terms)
+            ]
+        )
 
 
 def run(coro):
@@ -403,33 +441,27 @@ async def test_memories_whose_episode_is_gone_are_ingested_again(tmp_path: Path,
 
 
 class SearchGraphiti:
-    """Graphiti's two searches: the default hybrid one, which waits on OpenAI to embed the query,
-    and `search_` with a config, here only ever asked for the keyword index."""
+    """Graphiti's `search_`: the hybrid search when given the query's vector, which the embedder
+    takes its time to make, and the keyword index alone when not."""
 
     def __init__(self, embed_seconds: float, error: Exception | None = None) -> None:
-        self.embed_seconds = embed_seconds
-        self.error = error
+        self.embedder = FakeEmbedder(embed_seconds, error)
         self.configs: list = []
-        self.hybrid_finished = 0
-        self.hybrid_cancelled = 0
+        self.vectors: list = []
 
     @staticmethod
     def _edge(fact: str) -> SimpleNamespace:
         return SimpleNamespace(uuid=fact, fact=fact, valid_at=None, invalid_at=None, episodes=[])
 
-    async def search(self, query: str) -> list:
-        try:
-            await asyncio.sleep(self.embed_seconds)
-        except asyncio.CancelledError:
-            self.hybrid_cancelled += 1
-            raise
-        if self.error is not None:
-            raise self.error
-        self.hybrid_finished += 1
-        return [self._edge("hybrid match")]
+    @property
+    def hybrid_finished(self) -> int:
+        return len(self.vectors)
 
-    async def search_(self, query: str, config) -> SimpleNamespace:
+    async def search_(self, query: str, config, query_vector: list[float] | None = None) -> SimpleNamespace:
         self.configs.append(config)
+        if query_vector is not None:
+            self.vectors.append(query_vector)
+            return SimpleNamespace(edges=[self._edge("hybrid match")])
         return SimpleNamespace(edges=[self._edge("keyword match")])
 
     async def close(self) -> None:
@@ -444,7 +476,10 @@ def test_search_uses_the_hybrid_search_when_openai_answers_in_time(tmp_path: Pat
     facts = run(backend.search("office hours"))
 
     assert [fact.fact for fact in facts] == ["hybrid match"]
-    assert facts.keyword_only is False and client.configs == []
+    assert facts.keyword_only is False and client.embedder.texts == ["office hours"]
+    (config,) = client.configs
+    assert {method.value for method in config.edge_config.search_methods} == {"bm25", "cosine_similarity"}
+    assert config.limit == 10
 
 
 async def test_search_falls_back_to_keywords_when_openai_is_slow(tmp_path: Path, monkeypatch) -> None:
@@ -466,7 +501,7 @@ async def test_search_falls_back_to_keywords_when_openai_is_slow(tmp_path: Path,
     # The late hybrid search goes on: cancelling it would close the connection its OpenAI request
     # had just opened, so the next search would start cold as well.
     await asyncio.sleep(0.4)
-    assert (client.hybrid_finished, client.hybrid_cancelled) == (1, 0)
+    assert (client.hybrid_finished, client.embedder.cancelled) == (1, 0)
     assert not backend._unawaited
 
 
@@ -490,7 +525,223 @@ async def test_close_cancels_hybrid_searches_still_running(tmp_path: Path, monke
 
     await asyncio.wait_for(backend.close(), 1)
 
-    assert client.hybrid_cancelled == 1 and not backend._unawaited
+    assert client.embedder.cancelled == 1 and not backend._unawaited
+
+
+def test_search_puts_the_query_instruction_in_front_of_the_query(tmp_path: Path) -> None:
+    # Qwen3-Embedding finds fewer of the facts that answer a query without an instruction in front
+    # of it. Names and facts are embedded without one.
+    instruction = "Instruct: find the facts that answer the query\nQuery: "
+    backend = GraphitiBackend(tmp_path / "state", embedding=Embedding("local-embedder", query_instruction=instruction))
+    client = SearchGraphiti(embed_seconds=0)
+    backend._client = client
+
+    run(backend.search("office\nhours"))
+
+    assert client.embedder.texts == [instruction + "office hours"]
+
+
+async def test_search_answers_from_the_keyword_index_until_the_graph_is_re_embedded(tmp_path: Path) -> None:
+    # A query vector compares only with vectors from its own model.
+    backend = GraphitiBackend(tmp_path / "state")
+    client = SearchGraphiti(embed_seconds=0)
+    backend._client = client
+    backend._vectors_stale = True
+
+    facts = await backend.search("office hours")
+
+    assert [fact.fact for fact in facts] == ["keyword match"] and facts.keyword_only is True
+    assert client.embedder.texts == []
+
+
+def test_an_ingest_re_embeds_the_graph_before_it_adds_an_episode(tmp_path: Path, monkeypatch) -> None:
+    # Graphiti finds the entities and facts a new episode repeats by comparing their vectors.
+    store, backend, client = make_backend(tmp_path)
+    first = store.remember(title="Carrier", content="Acme ships orders with Parcelco.", kind="note")
+    second = store.remember(title="Office", content="The Springfield office opens at 9.", kind="note")
+    episodes_before_re_embeds: list[int] = []
+
+    async def reembed(_client) -> None:
+        episodes_before_re_embeds.append(client.added)
+
+    monkeypatch.setattr(backend, "_reembed", reembed)
+    backend._vectors_stale = True
+
+    run(backend.ingest(store.record(first["id"])))
+    run(backend.ingest(store.record(second["id"])))
+
+    assert episodes_before_re_embeds == [0] and client.added == 2 and backend._vectors_stale is False
+
+
+def test_a_model_on_another_server_gets_a_client_of_its_own(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "unused")  # building the clients makes no calls
+    monkeypatch.delenv("EMBED_KEY", raising=False)
+    openai_model = GraphitiBackend(tmp_path / "a")
+    openai_model._openai = GraphitiBackend._openai_client()
+    assert openai_model._embedding_client() is openai_model._openai
+
+    local = GraphitiBackend(tmp_path / "b", embedding=Embedding("local-embedder", base_url="http://127.0.0.1:11434/v1"))
+    client = local._embedding_client()
+    assert str(client.base_url) == "http://127.0.0.1:11434/v1/" and client.api_key == "unused"
+    assert local._embedding_client() is client
+
+    keyed = GraphitiBackend(
+        tmp_path / "c", embedding=Embedding("hosted-embedder", base_url="https://embed.example/v1", api_key_env="EMBED_KEY")
+    )
+    with pytest.raises(RuntimeError, match="EMBED_KEY"):
+        keyed._embedding_client()
+    monkeypatch.setenv("EMBED_KEY", "key-for-tests")
+    assert keyed._embedding_client().api_key == "key-for-tests"
+
+
+class FakeEmbedders(list):
+    """The FakeEmbedder each opened graph got in place of Graphiti's OpenAIEmbedder, and what the
+    next one will be like."""
+
+    seconds = 0.0
+    fail_batches = 0
+
+
+@pytest.fixture
+def fake_embedders(monkeypatch) -> FakeEmbedders:
+    import graphiti_core.embedder
+
+    made = FakeEmbedders()
+
+    def make(config, client) -> FakeEmbedder:
+        embedder = FakeEmbedder(made.seconds)
+        failures = made.fail_batches
+        real_batch = embedder.create_batch
+
+        async def create_batch(texts: list[str]) -> list[list[float]]:
+            nonlocal failures
+            if failures:
+                failures -= 1
+                raise RuntimeError("the embedding server is not up yet")
+            return await real_batch(texts)
+
+        embedder.create_batch = create_batch
+        made.append(embedder)
+        return embedder
+
+    monkeypatch.setattr(graphiti_core.embedder, "OpenAIEmbedder", make)
+    monkeypatch.setenv("OPENAI_API_KEY", "unused")  # opening the graph makes no OpenAI calls
+    return made
+
+
+# Two entities with a fact between them, a third whose name is blank, and a community, all with
+# vectors from an earlier model.
+GRAPH = """
+CREATE (:Entity {uuid: 'acme', name: 'Acme', name_embedding: vecf32([0.1, 0.2])})
+       -[:RELATES_TO {uuid: 'ships', fact: $fact, fact_embedding: vecf32([0.3, 0.4])}]->
+       (:Entity {uuid: 'parcelco', name: 'Parcelco', name_embedding: vecf32([0.5, 0.6])}),
+       (:Entity {uuid: 'blank', name: ' ', name_embedding: vecf32([0.7, 0.8])}),
+       (:Community {uuid: 'shipping', name: 'Shipping', name_embedding: vecf32([0.9, 1.0])})
+"""
+FACT = "Acme ships orders\nwith Parcelco."
+
+
+async def _graph_with_vectors(state_dir: Path, embedding: Embedding = Embedding()) -> None:
+    backend = GraphitiBackend(state_dir, embedding=embedding)
+    await backend.start()
+    try:
+        await backend._client.driver.execute_query(GRAPH, fact=FACT)
+    finally:
+        await backend.close()
+
+
+async def _vectors(backend: GraphitiBackend) -> dict[str, list[float] | None]:
+    nodes, _, _ = await backend._client.driver.execute_query("MATCH (x) RETURN x.uuid AS uuid, x.name_embedding AS vector")
+    edges, _, _ = await backend._client.driver.execute_query(
+        "MATCH ()-[x:RELATES_TO]->() RETURN x.uuid AS uuid, x.fact_embedding AS vector"
+    )
+    return {r["uuid"]: (list(r["vector"]) if r["vector"] is not None else None) for r in [*nodes, *edges]}
+
+
+async def test_a_graph_from_before_0_1_6_keeps_its_openai_vectors(tmp_path: Path, fake_embedders) -> None:
+    # Every graph so far was embedded by Graphiti's default model. A vault that upgrades and keeps
+    # it must not re-embed anything.
+    pytest.importorskip("redislite")
+    await _graph_with_vectors(tmp_path)
+    with connection(tmp_path / "graph-state.sqlite3") as conn:
+        conn.execute("DELETE FROM graph_meta")  # what an older engine left
+
+    backend = GraphitiBackend(tmp_path)
+    await backend.start()
+    try:
+        assert backend._vectors_stale is False and backend._reembedding is None
+        assert backend._meta("embedding") == "text-embedding-3-small, 1024 dimensions"
+    finally:
+        await backend.close()
+    assert [embedder.texts for embedder in fake_embedders] == [[], []]
+
+
+async def test_a_new_embedding_model_re_embeds_every_vector_and_saves_them(
+    tmp_path: Path, fake_embedders, monkeypatch, caplog
+) -> None:
+    psutil = pytest.importorskip("psutil")
+    import signal
+
+    from brain_engine import graph
+
+    monkeypatch.setattr(graph, "REEMBED_RETRY_SECONDS", 0.01)
+    await _graph_with_vectors(tmp_path)
+    local = Embedding("local-embedder", base_url="http://127.0.0.1:11434/v1", dimensions=2)
+    fake_embedders.fail_batches = 1  # an embedding server that starts after the service
+    backend = GraphitiBackend(tmp_path, embedding=local)
+    reembedded = {
+        "acme": FakeEmbedder.vector("Acme"),
+        "parcelco": FakeEmbedder.vector("Parcelco"),
+        "shipping": FakeEmbedder.vector("Shipping"),
+        "ships": FakeEmbedder.vector(FACT.replace("\n", " ")),
+        "blank": None,  # a blank name has no vector, as Graphiti leaves it
+    }
+    try:
+        with caplog.at_level(logging.WARNING, logger="brain_engine.graph"):
+            await backend.start()
+            assert backend._vectors_stale is True
+            await asyncio.wait_for(backend._reembedding, 10)
+        assert "The graph's vectors were made by text-embedding-3-small, 1024 dimensions." in caplog.text
+        assert "Re-embedding 3 entity names, 1 facts, 1 community names with local-embedder, 2 dimensions" in caplog.text
+        assert "the embedding server is not up yet" in caplog.text
+        assert "Re-embedded 2 entity names, 1 facts, 1 community names" in caplog.text
+        assert backend._vectors_stale is False and backend._meta("embedding") == "local-embedder, 2 dimensions"
+        assert await _vectors(backend) == reembedded
+
+        # The re-embed was saved, so a crash of the redis-server keeps it.
+        old_pid = backend._falkor.connection.pid
+        os.kill(old_pid, signal.SIGKILL)
+        await _until(lambda: not psutil.pid_exists(old_pid), "redis-server did not exit")
+        await backend.snapshot()  # opens the graph again on a new server
+        assert backend._falkor.connection.pid != old_pid
+        assert backend._vectors_stale is False and await _vectors(backend) == reembedded
+    finally:
+        await backend.close()
+    assert len(fake_embedders) == 3 and fake_embedders[2].texts == []
+
+
+async def test_a_re_embed_cut_short_is_done_again(tmp_path: Path, fake_embedders, caplog) -> None:
+    pytest.importorskip("redislite")
+    await _graph_with_vectors(tmp_path)
+    local = Embedding("local-embedder", dimensions=2)
+    fake_embedders.seconds = 30
+    stopped = GraphitiBackend(tmp_path, embedding=local)
+    await stopped.start()
+    await _until(lambda: stopped._meta("embedding") == MIXED_VECTORS, "the re-embed did not start")
+    await asyncio.wait_for(stopped.close(), 5)  # the service stops halfway
+    assert stopped._meta("embedding") == MIXED_VECTORS
+
+    fake_embedders.seconds = 0
+    backend = GraphitiBackend(tmp_path, embedding=local)
+    try:
+        with caplog.at_level(logging.WARNING, logger="brain_engine.graph"):
+            await backend.start()
+            await asyncio.wait_for(backend._reembedding, 10)
+        assert "A re-embed of the graph's vectors did not finish." in caplog.text
+        assert backend._meta("embedding") == "local-embedder, 2 dimensions"
+        assert (await _vectors(backend))["acme"] == FakeEmbedder.vector("Acme")
+    finally:
+        await backend.close()
 
 
 def test_ingested_hashes_lists_only_memories_whose_episode_is_in_the_graph(tmp_path: Path) -> None:

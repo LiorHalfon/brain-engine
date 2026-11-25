@@ -74,10 +74,41 @@ project = "projects"
 | `kinds` | see below | Memory kind to folder under `memory_dir`. `remember` refuses kinds not listed. |
 | `dated_kinds` | `[]` | Kinds whose new filenames start with the date, for memories that record an event. |
 | `graph_model`, `graph_small_model` | `gpt-6-luna` | The OpenAI models Graphiti uses to extract entities and facts. |
+| `embedding_model` | `text-embedding-3-small` | The model that embeds entity names, facts and search queries. See [A local embedding model](#a-local-embedding-model). |
+| `embedding_base_url` | OpenAI | An OpenAI-compatible server for the embedding model, such as Ollama's `http://127.0.0.1:11434/v1`. |
+| `embedding_dimensions` | `1024` | How many dimensions of each vector to keep. |
+| `embedding_query_instruction` | `""` | Text put in front of each search query, and not in front of names and facts, for models that expect one. |
+| `embedding_api_key_env` | unset | The environment variable with the embedding server's API key. Unset, OpenAI's model takes `OPENAI_API_KEY` and another server gets no key. |
 
 `remember` defaults to kind `note`, and `remember_session` writes `session` and `transcript`. If `kinds` leaves one of those out, the engine adds it: `note` to `notes/`, `session` to `sessions/`, `transcript` to `sessions/transcripts/`. Map them yourself to use other folders. A misspelled field, a dated kind with no folder or a missing `name` stops the engine with an error naming it.
 
 The graph models are set explicitly so that a graphiti-core upgrade can't switch them without anyone noticing. graphiti-core 0.30.2 defaulted to `gpt-4.1-nano`, and once OpenAI retired it every ingest failed with `model_not_found`. If you pick another model, check that the pinned graphiti-core sends it valid parameters. Some versions sent `reasoning.effort: minimal` to models that reject it.
+
+### A local embedding model
+
+Every search embeds its query before Graphiti's hybrid search can run. With OpenAI's model that is a network call of about 210 ms on an open connection and about a second on a new one. A small model on the same machine takes about 30 ms. On two vaults' graphs, a search through the engine took 266 and 255 ms at the median with OpenAI's model, and 32 and 65 ms with the local one. Ingest still needs OpenAI for the LLM that extracts entities and facts.
+
+[Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) through [Ollama](https://ollama.com) is the tested choice:
+
+```bash
+brew install ollama
+brew services start ollama          # starts at login
+ollama pull qwen3-embedding:0.6b    # 639 MB
+```
+
+```toml
+embedding_model = "qwen3-embedding:0.6b"
+embedding_base_url = "http://127.0.0.1:11434/v1"
+embedding_dimensions = 1024
+embedding_query_instruction = "Instruct: Given a search query, retrieve facts from a memory store that answer it\nQuery: "
+```
+
+- It finds what OpenAI's model finds. Taking each memory's title as a query and the facts extracted from that memory as its answers, the engine's search had one in its top ten for 66% of 300 queries on a graph of 6,700 facts, against 65% with OpenAI's model. On a graph of 150 facts it was 95% against 89%. On memories not written in English, the two models were within noise of each other.
+- Qwen3-Embedding needs the instruction. Compared on vectors alone, it had the right fact in its top five for 55% of queries without it and 63% with it, against 62% for OpenAI's model.
+- Ollama unloads a model after 5 idle minutes. Loading it again adds about 0.8 s to the next search, which still fits the search budget. Start Ollama with `OLLAMA_KEEP_ALIVE=-1` to keep it loaded.
+- If Ollama isn't running, search falls back to the graph's keyword index, and writes stay in Markdown and FTS until the graph can ingest them again, as with an OpenAI outage.
+
+Vectors from different models don't compare, so graph-state records in `graph_meta` which model made the graph's vectors. When the graph opens with another model in `brain.toml`, the service logs it and re-embeds every entity name, fact and community name in the background. That makes no LLM calls and ingests nothing again. For 2,900 entities and 6,700 facts it took about four minutes. Until it's done, search takes its graph facts from the keyword index and writes to the graph wait. If a stop cuts a re-embed short, the next start does it again in full. One that fails, say because the embedding server isn't up yet, tries again every minute. A graph from before 0.1.6 counts as `text-embedding-3-small` at 1024 dimensions, the only model older engines used. Going back to OpenAI's model re-embeds the same way, with OpenAI calls.
 
 ## Environment variables
 
@@ -94,7 +125,7 @@ The environment overrides `brain.toml`, which overrides the engine defaults. A b
 | `MEMORY_HUMAN_ID` | `owner` | Written to `verified.by` as `human:<id>` when a memory is verified. |
 | `MEMORY_GRAPH_ENABLED` | `true` | `false` serves Markdown and FTS only. |
 | `MEMORY_GRAPH_MODEL`, `MEMORY_GRAPH_SMALL_MODEL` | `graph_model`, `graph_small_model` | Graphiti's models. |
-| `OPENAI_API_KEY` | unset | Graphiti's LLM and embedding calls. Without it the service logs a warning and serves Markdown and FTS. |
+| `OPENAI_API_KEY` | unset | Graphiti's LLM calls, and its embedding calls unless `embedding_base_url` names another server. Without it the service logs a warning and serves Markdown and FTS. |
 
 Access mode and actor belong to the service, so every connected client shares them.
 
@@ -202,7 +233,7 @@ The page is read-only and answers only when the `Host` header is localhost, whic
 
 ### Timings
 
-The service writes one row per operation to `metrics.sqlite3`: the operation (the MCP tool name, `graph_ingest` for one background ingest, or `graph_view` for `/graph.json`), the total time, the part spent in Graphiti and its OpenAI calls (`graph_ms`), the rest (`store_ms`), the number of searchable memories at the time, and for writes the content size. A search also records whether its graph facts came from the keyword index alone (`keyword_only`), and every row records the service's resident memory (`rss_mb`). An operation that raised, or whose graph step failed and fell back, keeps the error. Recording never fails the operation. A background ingest that skipped an unchanged memory isn't recorded.
+The service writes one row per operation to `metrics.sqlite3`: the operation (the MCP tool name, `graph_ingest` for one background ingest, or `graph_view` for `/graph.json`), the total time, the part spent in Graphiti and its model calls (`graph_ms`), the rest (`store_ms`), the number of searchable memories at the time, and for writes the content size. A search also records whether its graph facts came from the keyword index alone (`keyword_only`), and every row records the service's resident memory (`rss_mb`). An operation that raised, or whose graph step failed and fell back, keeps the error. Recording never fails the operation. A background ingest that skipped an unchanged memory isn't recorded.
 
 `brain-engine metrics` reports the last 30 days. It gives p50, p90 and max per operation with the store and graph split. Then it gives the share of searches that got keyword-only facts, the service's median and peak memory, and the most frequent errors of the last 7 days, so a graph that fails every call shows up in one place. Last come the medians grouped by vault size, so a slowdown that comes with growth shows up as rising rows. Ingests also get Graphiti time per KB, because ingest time grows with the memory's size and only a rise per KB means the graph itself is slowing down.
 

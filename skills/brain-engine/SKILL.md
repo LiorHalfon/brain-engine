@@ -1,6 +1,6 @@
 ---
 name: brain-engine
-description: Use when working on a brain-engine memory vault (a folder with a brain.toml) or its service - setting up a vault, moving a vault's own memory server onto brain-engine, upgrading the pinned engine tag, `brain-engine serve` refusing to start, or cleaning up or rebuilding the vault's graph.
+description: Use when working on a brain-engine memory vault (a folder with a brain.toml) or its service - setting up a vault, moving a vault's own memory server onto brain-engine, upgrading the pinned engine tag, switching the graph's embedding model, `brain-engine serve` refusing to start, or cleaning up or rebuilding the vault's graph.
 ---
 
 # brain-engine vaults
@@ -58,6 +58,16 @@ The README's "Changes from the per-vault servers" lists what changes for the vau
 2. Change the tag in `pyproject.toml`, run `uv lock`, and commit both files.
 3. The running service keeps the old code until it restarts. Ask the user to restart it, then run the proof checks.
 4. Copy this skill again from the new tag, as the README's "Agent skill" shows.
+
+## Switching the embedding model
+
+The README's "A local embedding model" gives the `brain.toml` fields and the tested local model. It needs engine 0.1.6 or later, and an older tag refuses those fields.
+
+1. On each machine that runs the vault's service, install the model's server and start it as a login service, then check it answers: `curl -s http://127.0.0.1:11434/v1/embeddings -d '{"model": "<model>", "input": ["test"]}'` prints a vector.
+2. Add the fields to `brain.toml` and commit it. A vault shared between machines needs the server on all of them.
+3. Ask the user to restart the service. The log says "Re-embedding" with the counts, then "Re-embedded" when it's done, a few minutes for thousands of facts. Meanwhile search returns keyword-only graph facts and writes to the graph wait. A re-embed makes no LLM calls and ingests nothing again, so the rebuild rule doesn't apply.
+4. "Re-embedding the graph failed, trying again" means the embedding server didn't answer. Check that it runs and that `embedding_base_url` and `embedding_model` match it. The service tries every minute on its own.
+5. Run the proof checks once "Re-embedded" is in the log.
 
 ## When `serve` won't start
 

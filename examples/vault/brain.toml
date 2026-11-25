@@ -20,6 +20,12 @@ state_dir = ".brain"
 # Kinds that record an event get the date at the start of their filenames.
 dated_kinds = ["decision", "session", "transcript"]
 
+# The graph's embeddings come from OpenAI. For a model on this machine, see the README's
+# "A local embedding model":
+# embedding_model = "qwen3-embedding:0.6b"
+# embedding_base_url = "http://127.0.0.1:11434/v1"
+# embedding_query_instruction = "Instruct: Given a search query, retrieve facts from a memory store that answer it\nQuery: "
+
 # Memory kind = folder under memory_dir. note, session and transcript are added if left out.
 [kinds]
 decision = "decisions"

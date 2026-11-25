@@ -13,6 +13,9 @@ CONFIG_FILENAME = "brain.toml"
 DEFAULT_KINDS = {"note": "notes", "session": "sessions", "transcript": "sessions/transcripts"}
 # graphiti-core 0.31.2's own default, written down so that upgrading it can't switch models unnoticed.
 DEFAULT_GRAPH_MODEL = "gpt-6-luna"
+# Graphiti's default embedder, which made the vectors of every graph before 0.1.6.
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_PORT = 8766
 FIELDS = {
     "name",
@@ -24,6 +27,11 @@ FIELDS = {
     "dated_kinds",
     "graph_model",
     "graph_small_model",
+    "embedding_model",
+    "embedding_base_url",
+    "embedding_dimensions",
+    "embedding_query_instruction",
+    "embedding_api_key_env",
 }
 
 
@@ -96,6 +104,55 @@ def _port(raw: object, source: str) -> int:
 
 
 @dataclass(frozen=True)
+class Embedding:
+    """The model that turns the graph's entity names, its facts and search queries into vectors.
+
+    `base_url` is an OpenAI-compatible server, such as Ollama's `http://127.0.0.1:11434/v1`. Unset,
+    the model is OpenAI's. `query_instruction` goes in front of each search query and not in front
+    of the names and facts, as models like Qwen3-Embedding expect.
+    """
+
+    model: str = DEFAULT_EMBEDDING_MODEL
+    base_url: str | None = None
+    dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
+    query_instruction: str = ""
+    # The environment variable that holds the server's API key. Unset, OpenAI's model takes
+    # OPENAI_API_KEY and another server gets no key.
+    api_key_env: str | None = None
+
+    @property
+    def identity(self) -> str:
+        """What the stored vectors depend on. Vectors with different identities don't compare."""
+        return f"{self.model}, {self.dimensions} dimensions"
+
+
+def _embedding(config: dict[str, Any]) -> Embedding:
+    base_url = config.get("embedding_base_url")
+    if base_url is not None:
+        if not isinstance(base_url, str):
+            raise ConfigError(f"{CONFIG_FILENAME}: `embedding_base_url` must be a URL")
+        base_url = base_url.strip() or None
+        if base_url and not base_url.startswith(("http://", "https://")):
+            raise ConfigError(f"{CONFIG_FILENAME}: `embedding_base_url` must start with http:// or https://")
+    dimensions = config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS)
+    if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1:
+        raise ConfigError(f"{CONFIG_FILENAME}: `embedding_dimensions` must be a positive whole number")
+    instruction = config.get("embedding_query_instruction", "")
+    if not isinstance(instruction, str):
+        raise ConfigError(f"{CONFIG_FILENAME}: `embedding_query_instruction` must be a string")
+    api_key_env = config.get("embedding_api_key_env")
+    if api_key_env is not None:
+        api_key_env = _str(config, "embedding_api_key_env")
+    return Embedding(
+        model=_str(config, "embedding_model", DEFAULT_EMBEDDING_MODEL),
+        base_url=base_url,
+        dimensions=dimensions,
+        query_instruction=instruction,
+        api_key_env=api_key_env,
+    )
+
+
+@dataclass(frozen=True)
 class Settings:
     """One vault's settings: its brain.toml, overridden by the environment, over engine defaults."""
 
@@ -114,6 +171,7 @@ class Settings:
     graph_enabled: bool
     graph_model: str
     graph_small_model: str
+    embedding: Embedding
 
     @property
     def url(self) -> str:
@@ -169,4 +227,5 @@ class Settings:
                 _env(environ, "MEMORY_GRAPH_SMALL_MODEL")
                 or _str(config, "graph_small_model", DEFAULT_GRAPH_MODEL)
             ),
+            embedding=_embedding(config),
         )
